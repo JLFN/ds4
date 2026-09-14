@@ -7,13 +7,21 @@
 # mixed Q4_K/Q6_K routed down, Q6_K output, 1M-context YaRN rope) is
 # accepted on CUDA by the laguna-crack branch built into this tree.
 #
-# Context: the deployed GGUF carries 1048576 as its context_length and the
-# engine adopts the export's rope config, so -c may go up to 1M; KV is cheap
-# because 36 of 48 layers keep a 512-token sliding window (about 12 GiB at
-# 262144 tokens, about 48 GiB at 1M). Start at 262144 and raise only if the
-# free memory allows: the model itself needs 67.75 GiB resident.
+# Context sizing (measured on this box, 2026-09-14):
+#   - the model needs 67.75 GiB resident;
+#   - the graph scratch is fixed at about 5.9 GiB (prefill cap 16384);
+#   - KV costs 49,152 bytes per token: 36 of the 48 layers keep a
+#     512-token sliding window, only 12 hold the full context, so
+#     32768 tokens cost 1.57 GiB and 1048576 cost 48.07 GiB.
+#   Total at 1M is about 121.6 GiB, more than this box can give, so 1M is
+#   NOT reachable; roughly 800k is the ceiling. 262144 is the default and
+#   the shipped configuration.
 #
-# Usage: ./start-laguna-crack-ds4.sh [start|stop|status]
+# The script refuses a context that cannot fit and says so, instead of
+# letting the load fail with an allocation error. Override with
+# LAGUNA_FORCE=1 if you want to try anyway.
+#
+# Usage: ./start-laguna-crack-ds4.sh [start|stop|status|plan]
 set -euo pipefail
 
 MODEL="${LAGUNA_CRACK_MODEL:-/home/leandro/models/Laguna-S-2.1-CRACK-Q4_K_M.gguf}"
@@ -23,10 +31,30 @@ PORT="${LAGUNA_PORT:-8002}"
 LOG="${LAGUNA_LOG:-/tmp/laguna-crack-ds4.log}"
 PIDFILE="${LAGUNA_PIDFILE:-/tmp/laguna-crack-ds4.pid}"
 DFLASH="${LAGUNA_DFLASH:-}"
+BUDGET_GIB="${LAGUNA_BUDGET_GIB:-115}"   # usable unified memory to plan against
+FORCE="${LAGUNA_FORCE:-0}"
+
+GIB=$((1024 * 1024 * 1024))
+
+# KV bytes = 4096 * (12 * ctx + 36 * 512); see ds4.c:47946.
+kv_gib() {
+    python3 -c "print(f'{(4096 * (12 * int('$1') + 36 * 512)) / $GIB:.2f}')"
+}
+
+plan() {
+    local model_gib scratch_gib kv total
+    model_gib=$(python3 -c "import os;print(f'{os.path.getsize(\"$MODEL\") / $GIB:.2f}')")
+    scratch_gib=5.9
+    kv=$(kv_gib "$CTX")
+    total=$(python3 -c "print(f'{float(\"$model_gib\") + float(\"$kv\") + $scratch_gib:.2f}')")
+    printf 'model %s GiB + KV %s GiB (ctx %s) + scratch %s GiB = %s GiB (budget %s GiB)\n' \
+        "$model_gib" "$kv" "$CTX" "$scratch_gib" "$total" "$BUDGET_GIB"
+    python3 -c "import sys; sys.exit(0 if float('$total') <= float('$BUDGET_GIB') else 1)"
+}
 
 status() {
     if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-        echo "running pid=$(cat "$PIDFILE") port=$PORT"
+        echo "running pid=$(cat "$PIDFILE") port=$PORT ctx=$CTX"
         curl -sS --max-time 3 "http://127.0.0.1:$PORT/v1/models" | head -c 300
         echo
         return 0
@@ -53,9 +81,18 @@ start)
     fi
     [ -f "$MODEL" ] || { echo "model not found: $MODEL" >&2; exit 1; }
     [ -x "$SERVER" ] || { echo "server not found: $SERVER" >&2; exit 1; }
+    echo "plan: $(plan || true)"
+    if ! plan >/dev/null 2>&1; then
+        echo "refusing: ctx $CTX does not fit ($BUDGET_GIB GiB budget)." >&2
+        echo "1M is not reachable on this box; try up to ~800k, or raise" >&2
+        echo "LAGUNA_BUDGET_GIB, or set LAGUNA_FORCE=1 to attempt it anyway." >&2
+        [ "$FORCE" = "1" ] || exit 2
+        echo "LAGUNA_FORCE=1: continuing anyway" >&2
+    fi
     EXTRA=()
     if [ -n "$DFLASH" ] && [ -f "$DFLASH" ]; then
         EXTRA+=(--dflash "$DFLASH" --dflash-draft 15)
+        echo "DFlash draft: $DFLASH"
     fi
     nohup "$SERVER" --cuda -m "$MODEL" -c "$CTX" \
         --host 0.0.0.0 --port "$PORT" "${EXTRA[@]}" \
@@ -66,5 +103,6 @@ start)
     ;;
 stop) stop ;;
 status) status ;;
-*) echo "usage: $0 [start|stop|status]" >&2; exit 2 ;;
+plan) plan ;;
+*) echo "usage: $0 [start|stop|status|plan]" >&2; exit 2 ;;
 esac
