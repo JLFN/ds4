@@ -299,6 +299,16 @@ tests/test_gpu_lookup_cache_strict.o: tests/test_gpu_lookup_cache_strict.c ds4_g
 tests/test_gpu_lookup_cache_strict: tests/test_gpu_lookup_cache_strict.o ds4_cuda.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
+tests/test_laguna_crack_kernels.o: tests/test_laguna_crack_kernels.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_laguna_crack_kernels: tests/test_laguna_crack_kernels.o ds4_cuda.o
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+.PHONY: test-laguna-crack-kernels
+test-laguna-crack-kernels: tests/test_laguna_crack_kernels
+	./tests/test_laguna_crack_kernels
+
 ds4_cuda_test_hooks.o: ds4.c ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_TEST_HOOKS -I$(CUDA_HOME)/include -c -o $@ ds4.c
 
