@@ -40,3 +40,4 @@ graphify-rs-out/
 graphify-out/
 .rag-index/
 .callgraph-index.bin
+ds4_clone-handoff.md

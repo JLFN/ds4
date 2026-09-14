@@ -24,8 +24,8 @@
 # Usage: ./start-laguna-crack-ds4.sh [start|stop|status|plan]
 set -euo pipefail
 
-MODEL="${LAGUNA_CRACK_MODEL:-/home/leandro/models/Laguna-S-2.1-CRACK-Q4_K_M.gguf}"
-SERVER="${DS4_SERVER:-/home/leandro/ds4-laguna-crack/ds4-server}"
+MODEL="${LAGUNA_CRACK_MODEL:-$HOME/models/Laguna-S-2.1-CRACK-Q4_K_M.gguf}"
+SERVER="${DS4_SERVER:-$(cd -- "$(dirname -- "$0")" && pwd)/ds4-server}"
 CTX="${LAGUNA_CTX:-262144}"
 PORT="${LAGUNA_PORT:-8002}"
 LOG="${LAGUNA_LOG:-/tmp/laguna-crack-ds4.log}"
