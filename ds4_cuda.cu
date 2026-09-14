@@ -17088,8 +17088,11 @@ __device__ static float quarter_warp_sum_f32(float v, uint32_t lane8) {
 }
 
 __global__ static void q8_K_quantize_kernel(cuda_block_q8_K *out, const float *x, uint32_t in_dim, uint32_t n_rows) {
-    uint32_t b = blockIdx.x;
-    uint32_t row = blockIdx.y;
+    const uint32_t b = blockIdx.x;
+    /* Fold grid.z into the row index: a long-prefill routed MoE quantizes
+     * n_tokens * n_expert rows (163840 for a 16384-token Laguna chunk),
+     * beyond the 65535 limit on blockIdx.y. */
+    const uint32_t row = blockIdx.y + blockIdx.z * gridDim.y;
     if (row >= n_rows || b >= in_dim / CUDA_QK_K) return;
     const float *xr = x + (uint64_t)row * in_dim + (uint64_t)b * CUDA_QK_K;
     cuda_block_q8_K *yb = out + (uint64_t)row * (in_dim / CUDA_QK_K) + b;
@@ -17244,7 +17247,7 @@ __global__ static void q8_K_quantize_owned_kernel(
         uint32_t expert_base,
         uint32_t expert_count) {
     const uint32_t b = blockIdx.x;
-    const uint32_t row = blockIdx.y;
+    const uint32_t row = blockIdx.y + blockIdx.z * gridDim.y;
     if (row >= n_rows || b >= in_dim / CUDA_QK_K) return;
     if (!moe_owned_local_expert(selected[row], expert_base, expert_count, NULL)) return;
 
@@ -17320,7 +17323,7 @@ __global__ static void q8_K_quantize_sidecar_kernel(
         uint32_t in_dim,
         uint32_t n_rows) {
     uint32_t b = blockIdx.x;
-    uint32_t row = blockIdx.y;
+    uint32_t row = blockIdx.y + blockIdx.z * gridDim.y;
     const uint32_t blocks = in_dim / CUDA_QK_K;
     if (row >= n_rows || b >= blocks) return;
     const float *xr = x + (uint64_t)row * in_dim + (uint64_t)b * CUDA_QK_K;
@@ -17365,6 +17368,42 @@ __global__ static void q8_K_quantize_sidecar_kernel(
         yb->bsums[tid] = (int16_t)sum;
     }
     if (tid == 0u) yb->d = 1.0f / iscale_s;
+}
+
+/* grid.y is capped at 65535 by CUDA, but a long-prefill routed MoE
+ * quantizes n_tokens * n_expert rows: 163840 for a 16384-token Laguna
+ * chunk. The q8_K quantizers fold blockIdx.z into the row index, so these
+ * launchers keep grid.y within the cap and spread the rest over grid.z. */
+#define DS4_Q8K_GRID_Y_MAX 65535u
+
+static dim3 q8_K_row_grid(uint32_t blocks, uint32_t n_rows) {
+    const uint32_t gy = n_rows < DS4_Q8K_GRID_Y_MAX ? n_rows : DS4_Q8K_GRID_Y_MAX;
+    const uint32_t gz = (n_rows + gy - 1u) / gy;
+    return dim3(blocks, gy, gz);
+}
+
+static void q8_K_quantize_launch(cuda_block_q8_K *out, const float *x,
+                                 uint32_t in_dim, uint32_t n_rows) {
+    if (n_rows == 0u || in_dim < CUDA_QK_K) return;
+    q8_K_quantize_kernel<<<q8_K_row_grid(in_dim / CUDA_QK_K, n_rows), 256>>>(
+            out, x, in_dim, n_rows);
+}
+
+static void q8_K_quantize_owned_launch(cuda_block_q8_K *out, const float *x,
+                                       const int32_t *selected, uint32_t in_dim,
+                                       uint32_t n_rows, uint32_t expert_base,
+                                       uint32_t expert_count) {
+    if (n_rows == 0u || in_dim < CUDA_QK_K) return;
+    q8_K_quantize_owned_kernel<<<q8_K_row_grid(in_dim / CUDA_QK_K, n_rows), 256>>>(
+            out, x, selected, in_dim, n_rows, expert_base, expert_count);
+}
+
+static void q8_K_quantize_sidecar_launch(cuda_block_q8_K *out, const float *x,
+                                         const float *amax_sidecar,
+                                         uint32_t in_dim, uint32_t n_rows) {
+    if (n_rows == 0u || in_dim < CUDA_QK_K) return;
+    q8_K_quantize_sidecar_kernel<<<q8_K_row_grid(in_dim / CUDA_QK_K, n_rows), 256>>>(
+            out, x, amax_sidecar, in_dim, n_rows);
 }
 
 __global__ static DS4_CUDA_UNUSED void moe_gate_up_mid_kernel(
@@ -19683,10 +19722,14 @@ __global__ static void laguna_moe_gate_up_q6K_kernel(
         uint64_t gate_row_bytes,
         uint32_t xq_blocks,
         uint32_t expert_mid_dim,
-        uint32_t n_expert) {
+        uint32_t n_expert,
+        uint32_t pair_count) {
     const uint32_t lane = threadIdx.x & 15u;
     const uint32_t row_lane = threadIdx.x >> 4u;
-    const uint32_t pair = blockIdx.y;
+    /* grid.y is capped at 65535 and pair_count is n_tokens * n_expert, so
+     * the pair index folds grid.z in and the tail slice bails out. */
+    const uint32_t pair = blockIdx.y + blockIdx.z * gridDim.y;
+    if (pair >= pair_count) return;
     const uint32_t tok = pair / n_expert;
     const uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
@@ -22765,9 +22808,8 @@ static int routed_moe_launch(
         }
         if (prof_ev[3]) (void)cudaEventRecord(prof_ev[3], 0);
         if (ok && !use_direct_midq) {
-            dim3 midq_grid(midq_blocks, n_tokens * n_expert, 1);
             if (use_q4_midq_sidecar) {
-                q8_K_quantize_sidecar_kernel<<<midq_grid, 256>>>(
+                q8_K_quantize_sidecar_launch(
                         midq,
                         (const float *)mid->ptr,
                         midq_sidecar,
@@ -22775,7 +22817,7 @@ static int routed_moe_launch(
                         n_tokens * n_expert);
                 ok = cuda_ok(cudaGetLastError(), "routed_moe mid sidecar quantize launch");
             } else if (use_owned_sparse_buffers) {
-                q8_K_quantize_owned_kernel<<<midq_grid, 256>>>(
+                q8_K_quantize_owned_launch(
                         midq,
                         (const float *)mid->ptr,
                         (const int32_t *)selected->ptr,
@@ -22786,7 +22828,7 @@ static int routed_moe_launch(
                 ok = cuda_ok(cudaGetLastError(),
                              "owned routed_moe active mid quantize launch");
             } else {
-                q8_K_quantize_kernel<<<midq_grid, 256>>>(midq, (const float *)mid->ptr, expert_mid_dim, n_tokens * n_expert);
+                q8_K_quantize_launch(midq, (const float *)mid->ptr, expert_mid_dim, n_tokens * n_expert);
                 ok = cuda_ok(cudaGetLastError(), "routed_moe mid quantize launch");
             }
         }
@@ -28008,15 +28050,19 @@ static int laguna_routed_moe_q34_batch(
         }
     } else if (weight_type == 14u) {
         /* All-Q6_K export: no tiled kernels, the exact per-pair kernel runs
-         * at every batch size. */
+         * at every batch size. grid.y is capped at 65535, so a long prefill
+         * (pair_count = n_tokens * n_expert) splits across grid.z. */
+        const uint32_t gy = pair_count < DS4_Q8K_GRID_Y_MAX
+                                ? pair_count : DS4_Q8K_GRID_Y_MAX;
+        const uint32_t gz = (pair_count + gy - 1u) / gy;
         const dim3 gate_grid(
-            (expert_mid_dim + 255u) / 256u, pair_count, 1);
+            (expert_mid_dim + 255u) / 256u, gy, gz);
         laguna_moe_gate_up_q6K_kernel<<<gate_grid, 256>>>(
             (float *)mid->ptr, gw, uw, xq,
             (const int32_t *)selected->ptr,
             (const float *)weights->ptr,
             gate_expert_bytes, gate_row_bytes,
-            xq_blocks, expert_mid_dim, n_expert);
+            xq_blocks, expert_mid_dim, n_expert, pair_count);
     } else if (q4k) {
         const dim3 gate_grid(
             (expert_mid_dim + MOE_DECODE_ROWS_PER_BLOCK - 1u) /
@@ -28043,10 +28089,8 @@ static int laguna_routed_moe_q34_batch(
         return 0;
     }
 
-    q8_K_quantize_kernel<<<
-        dim3(midq_blocks, pair_count, 1), 256>>>(
-        midq, (const float *)mid->ptr,
-        expert_mid_dim, pair_count);
+    q8_K_quantize_launch(midq, (const float *)mid->ptr,
+                         expert_mid_dim, pair_count);
     if (!cuda_ok(cudaGetLastError(),
                  "Laguna routed MoE intermediate quantize launch")) {
         return 0;
@@ -28331,8 +28375,7 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
                         gate_expert_bytes, gate_row_bytes,
                         up_expert_bytes, up_row_bytes,
                         xq_blocks, expert_mid_dim, n_expert, cap);
-                q8_K_quantize_kernel<<<
-                        dim3(midq_blocks, n_tokens * n_expert, 1), 256>>>(
+                q8_K_quantize_launch(
                         (cuda_block_q8_K *)midq_scratch[dev]->ptr,
                         mid_work,
                         expert_mid_dim, n_tokens * n_expert);
@@ -28429,7 +28472,7 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
                     gate_expert_bytes, gate_row_bytes,
                     up_expert_bytes, up_row_bytes,
                     xq_blocks, expert_mid_dim, n_expert, cap);
-            q8_K_quantize_kernel<<<dim3(midq_blocks, n_tokens * n_expert, 1), 256>>>(
+            q8_K_quantize_launch(
                     (cuda_block_q8_K *)midq_scratch[dev]->ptr,
                     mid_work, expert_mid_dim, n_tokens * n_expert);
             cudaMemsetAsync(out_work, 0,
@@ -28498,8 +28541,7 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
     }
 
     {
-        dim3 gq(midq_blocks, n_tokens * n_expert, 1);
-        q8_K_quantize_kernel<<<gq, 256>>>(
+        q8_K_quantize_launch(
                 (cuda_block_q8_K *)midq_scratch[dev]->ptr,
                 mid_work, expert_mid_dim, n_tokens * n_expert);
     }

@@ -528,6 +528,189 @@ static void test_moe(struct moe_case c) {
     ds4_gpu_tensor_free(xt);
 }
 
+/* The routed MoE quantizes n_tokens * n_expert intermediate rows. A long
+ * prefill chunk (16384 tokens x 10 experts = 163840 rows) exceeds the
+ * 65535 blockIdx.y limit, which made the intermediate quantize launch
+ * fail with cudaErrorInvalidValue and the whole prefill abort after the
+ * first MoE layer. This case drives the same mixed layout with a large
+ * batch and checks one token's output against the CPU reference; the
+ * launch-geometry part is what the regression is about. */
+static void test_moe_large_batch(uint32_t gate_type, uint32_t down_type) {
+    const uint32_t in_dim = 512, mid_dim = 256, out_dim = 512;
+    const uint32_t n_total = 2, n_used = 2;
+    const uint32_t n_tokens = 40000;   /* pair_count = 80000 > 65535 */
+    const uint32_t gb_in = in_dim / QK_K;
+    const uint32_t gb_mid = mid_dim / QK_K;
+    const uint64_t gu_block = (gate_type == 12u) ? sizeof(block_q4_K)
+                                                 : sizeof(block_q6_K);
+    const uint64_t dn_block = (down_type == 12u) ? sizeof(block_q4_K)
+                                                 : sizeof(block_q6_K);
+    const uint64_t gu_row = (uint64_t)gb_in * gu_block;
+    const uint64_t dn_row = (uint64_t)gb_mid * dn_block;
+    const uint64_t gu_expert = (uint64_t)mid_dim * gu_row;
+    const uint64_t dn_expert = (uint64_t)out_dim * dn_row;
+    const uint64_t gu_bytes = (uint64_t)n_total * gu_expert;
+    const uint64_t dn_bytes = (uint64_t)n_total * dn_expert;
+
+    uint64_t cursor = g_model_size - (1u << 20);
+    cursor -= gu_bytes;
+    const uint64_t gate_off = cursor;
+    cursor -= gu_bytes;
+    const uint64_t up_off = cursor;
+    cursor -= dn_bytes;
+    const uint64_t down_off = cursor;
+
+    if (gate_type == 12u) {
+        random_q4_K_rows((block_q4_K *)(g_model + gate_off),
+                         n_total * mid_dim, gb_in);
+        random_q4_K_rows((block_q4_K *)(g_model + up_off),
+                         n_total * mid_dim, gb_in);
+    } else {
+        random_q6_K_rows((block_q6_K *)(g_model + gate_off),
+                         n_total * mid_dim, gb_in);
+        random_q6_K_rows((block_q6_K *)(g_model + up_off),
+                         n_total * mid_dim, gb_in);
+    }
+    if (down_type == 12u) {
+        random_q4_K_rows((block_q4_K *)(g_model + down_off),
+                         n_total * out_dim, gb_mid);
+    } else {
+        random_q6_K_rows((block_q6_K *)(g_model + down_off),
+                         n_total * out_dim, gb_mid);
+    }
+
+    const uint64_t pair_count = (uint64_t)n_tokens * n_used;
+    int32_t *sel_host = malloc(pair_count * sizeof(int32_t));
+    float *wt_host = malloc(pair_count * sizeof(float));
+    float *x_host = malloc((size_t)n_tokens * in_dim * sizeof(float));
+    float *out_host = malloc((size_t)n_tokens * out_dim * sizeof(float));
+    if (!sel_host || !wt_host || !x_host || !out_host) {
+        fprintf(stderr, "FAIL: large-batch host allocation\n");
+        exit(1);
+    }
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        sel_host[(size_t)t * n_used + 0] = 1;
+        sel_host[(size_t)t * n_used + 1] = 0;
+        wt_host[(size_t)t * n_used + 0] = 0.6f;
+        wt_host[(size_t)t * n_used + 1] = 0.4f;
+    }
+    random_f32(x_host, (size_t)n_tokens * in_dim);
+
+    ds4_gpu_tensor *xt = ds4_gpu_tensor_alloc(
+            (uint64_t)n_tokens * in_dim * sizeof(float));
+    ds4_gpu_tensor *sel = ds4_gpu_tensor_alloc(pair_count * sizeof(int32_t));
+    ds4_gpu_tensor *wt = ds4_gpu_tensor_alloc(pair_count * sizeof(float));
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc(
+            pair_count * mid_dim * sizeof(float));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(
+            (uint64_t)n_tokens * out_dim * sizeof(float));
+    if (!xt || !sel || !wt || !mid || !out) {
+        fprintf(stderr, "FAIL: large-batch tensor alloc\n");
+        exit(1);
+    }
+    ds4_gpu_tensor_write(xt, 0, x_host,
+                         (uint64_t)n_tokens * in_dim * sizeof(float));
+    ds4_gpu_tensor_write(sel, 0, sel_host, pair_count * sizeof(int32_t));
+    ds4_gpu_tensor_write(wt, 0, wt_host, pair_count * sizeof(float));
+
+    char name[96];
+    snprintf(name, sizeof(name),
+             "large batch %s gate/up + %s down (pair_count=%llu)",
+             gate_type == 12u ? "Q4_K" : "Q6_K",
+             down_type == 12u ? "Q4_K" : "Q6_K",
+             (unsigned long long)pair_count);
+
+    const int rc = ds4_gpu_glm_routed_moe_batch_tensor(
+            out, mid, g_model, g_model_size,
+            gate_off, up_off, down_off,
+            gate_type, gate_type, down_type,
+            gu_expert, gu_row, gu_expert, gu_row,
+            dn_expert, dn_row,
+            in_dim, mid_dim, out_dim,
+            sel, wt, n_total, n_used, 0, xt, n_tokens,
+            n_used * mid_dim, true);
+    CHECK(rc != 0, "%s rc", name);
+    if (rc) {
+        /* Spot-check the first and last token against the CPU reference. */
+        const uint32_t probes[2] = { 0u, n_tokens - 1u };
+        for (int p = 0; p < 2; p++) {
+            const uint32_t tok = probes[p];
+            ds4_gpu_tensor_read(out,
+                                (uint64_t)tok * out_dim * sizeof(float),
+                                out_host, out_dim * sizeof(float));
+            block_q8_K xq[8];
+            const float *xr = x_host + (size_t)tok * in_dim;
+            for (uint32_t b = 0; b < gb_in; b++) {
+                q8_K_quantize(&xq[b], xr + (size_t)b * QK_K);
+            }
+            double worst_rel = 0.0;
+            for (uint32_t r = 0; r < out_dim; r++) {
+                double ref = 0.0, norm = 0.0;
+                for (uint32_t slot = 0; slot < n_used; slot++) {
+                    const uint32_t expert = (uint32_t)sel_host[
+                            (size_t)tok * n_used + slot];
+                    float mid_host[256];
+                    for (uint32_t row = 0; row < mid_dim; row++) {
+                        double g = 0.0, u = 0.0;
+                        for (uint32_t i = 0; i < in_dim; i++) {
+                            const float qx = xq[i / QK_K].d *
+                                             (float)xq[i / QK_K].qs[i % QK_K];
+                            if (gate_type == 12u) {
+                                g += q4_K_value((const block_q4_K *)(g_model + gate_off) +
+                                                    ((size_t)expert * mid_dim + row) * gb_in, i) * qx;
+                                u += q4_K_value((const block_q4_K *)(g_model + up_off) +
+                                                    ((size_t)expert * mid_dim + row) * gb_in, i) * qx;
+                            } else {
+                                g += q6_K_value((const block_q6_K *)(g_model + gate_off) +
+                                                    ((size_t)expert * mid_dim + row) * gb_in, i) * qx;
+                                u += q6_K_value((const block_q6_K *)(g_model + up_off) +
+                                                    ((size_t)expert * mid_dim + row) * gb_in, i) * qx;
+                            }
+                        }
+                        mid_host[row] = silu_f32((float)g) * (float)u *
+                                        wt_host[(size_t)tok * n_used + slot];
+                    }
+                    block_q8_K mq[4];
+                    for (uint32_t b = 0; b < gb_mid; b++) {
+                        q8_K_quantize(&mq[b], mid_host + (size_t)b * QK_K);
+                    }
+                    for (uint32_t i = 0; i < mid_dim; i++) {
+                        const float qm = mq[i / QK_K].d *
+                                         (float)mq[i / QK_K].qs[i % QK_K];
+                        const float dw = (down_type == 12u)
+                            ? q4_K_value((const block_q4_K *)(g_model + down_off) +
+                                             (size_t)expert * out_dim * gb_mid +
+                                             (size_t)r * gb_mid, i)
+                            : q6_K_value((const block_q6_K *)(g_model + down_off) +
+                                             (size_t)expert * out_dim * gb_mid +
+                                             (size_t)r * gb_mid, i);
+                        ref += (double)dw * qm;
+                        norm += fabsf(dw * qm);
+                    }
+                }
+                const float err = fabsf((float)ref - out_host[r]);
+                const float lim = 0.005f * fabsf((float)ref) +
+                                  0.002f * (float)norm;
+                const double rel = (double)err / (lim > 1e-6f ? lim : 1e-6f);
+                if (rel > worst_rel) worst_rel = rel;
+            }
+            CHECK(worst_rel <= 1.0,
+                  "%s token %u vs CPU ref (worst=%.3f of limit)",
+                  name, tok, worst_rel);
+        }
+    }
+
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(wt);
+    ds4_gpu_tensor_free(sel);
+    ds4_gpu_tensor_free(xt);
+    free(out_host);
+    free(x_host);
+    free(wt_host);
+    free(sel_host);
+}
+
 int main(void) {
     int dev_count = 0;
     (void)cudaGetDeviceCount(&dev_count);
@@ -556,6 +739,11 @@ int main(void) {
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         test_moe(cases[i]);
     }
+
+    /* Regression: pair counts past the 65535 grid.y cap (long prefill). */
+    test_moe_large_batch(12u, 14u);   /* CRACK Q4_K_M: Q4_K gate/up, Q6_K down */
+    test_moe_large_batch(12u, 12u);
+    test_moe_large_batch(14u, 14u);
 
     printf("\n%s (%d failures)\n", g_failures ? "FAILED" : "PASSED",
            g_failures);
