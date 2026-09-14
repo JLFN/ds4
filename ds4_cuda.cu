@@ -68,6 +68,13 @@ typedef struct {
 } cuda_block_q4_K;
 
 typedef struct {
+    uint8_t ql[CUDA_QK_K / 2];
+    uint8_t qh[CUDA_QK_K / 4];
+    int8_t scales[CUDA_QK_K / 16];
+    uint16_t d;
+} cuda_block_q6_K;
+
+typedef struct {
     float d;
     int8_t qs[CUDA_QK_K];
     int16_t bsums[CUDA_QK_K / 16];
@@ -79,6 +86,8 @@ typedef struct {
 } cuda_block_iq2_xxs;
 
 static_assert(sizeof(cuda_block_q3_K) == 110, "Q3_K block layout mismatch");
+static_assert(sizeof(cuda_block_q4_K) == 144, "Q4_K block layout mismatch");
+static_assert(sizeof(cuda_block_q6_K) == 210, "Q6_K block layout mismatch");
 
 #include "ds4_gpu_mgpu.h"
 #include "ds4_iq2_tables_cuda.inc"
@@ -16561,6 +16570,25 @@ __device__ static void dev_q4_K_get_scale_min(
     }
 }
 
+/* Per-element Q4_K dequantization (flat element index inside the row),
+ * matching the CPU reference ds4_vec_dot_q4_K_f32 group walk. */
+__device__ __forceinline__ static float dev_q4_K_value(
+        const cuda_block_q4_K *blocks,
+        uint32_t k) {
+    const cuda_block_q4_K *block = blocks + k / CUDA_QK_K;
+    const uint32_t idx = k & (CUDA_QK_K - 1u);
+    const uint32_t group = idx >> 5u;
+    const uint32_t lane = idx & 31u;
+    uint8_t scale = 0;
+    uint8_t min_scale = 0;
+    dev_q4_K_get_scale_min(group, block->scales, &scale, &min_scale);
+    const uint32_t byte_off = (group >> 1u) * 32u + lane;
+    const uint32_t shift = (group & 1u) * 4u;
+    const uint32_t q = (block->qs[byte_off] >> shift) & 0x0fu;
+    return dev_f16_to_f32(block->d) * (float)scale * (float)q -
+           dev_f16_to_f32(block->dmin) * (float)min_scale;
+}
+
 __device__ __forceinline__ static int32_t dev_dot_q4_32(const uint8_t *qs, const int8_t *q8, int shift) {
     int32_t sum = 0;
     #pragma unroll
@@ -16586,6 +16614,82 @@ __device__ static float dev_dot_q4_K_q8_K_block(const cuda_block_q4_K *x, const 
         isum += (int)sc * dev_dot_q4_32(x->qs + byte_off, y->qs + j * 32u, shift);
     }
     return y->d * xd * (float)isum - y->d * xmin * (float)summs;
+}
+
+/* Per-element Q6_K dequantization.  K is the flat element index inside the
+ * row; ql/qh decode six-bit values as (4 low bits | 2 high bits << 4) - 32
+ * with one int8 scale per 16 elements, matching the CPU reference
+ * ds4_vec_dot_q6_K_f32 block walk (ds4.c). */
+__device__ __forceinline__ static float dev_q6_K_value(
+        const cuda_block_q6_K *blocks,
+        uint32_t k) {
+    const cuda_block_q6_K *block = blocks + k / CUDA_QK_K;
+    const uint32_t idx = k & (CUDA_QK_K - 1u);
+    const uint32_t half = idx >> 7u;
+    const uint32_t within = idx & 127u;
+    const uint32_t lane = within & 31u;
+    const uint32_t quarter = within >> 5u;
+    const uint32_t ql_base = half * 64u;
+    const uint32_t qh_base = half * 32u;
+    const uint32_t scale_base = half * 8u;
+    uint32_t q = 0;
+    int32_t scale = 0;
+    if (quarter == 0u) {
+        q = (block->ql[ql_base + lane] & 0x0fu) |
+            (((block->qh[qh_base + lane] >> 0u) & 3u) << 4u);
+        scale = block->scales[scale_base + lane / 16u + 0u];
+    } else if (quarter == 1u) {
+        q = (block->ql[ql_base + 32u + lane] & 0x0fu) |
+            (((block->qh[qh_base + lane] >> 2u) & 3u) << 4u);
+        scale = block->scales[scale_base + lane / 16u + 2u];
+    } else if (quarter == 2u) {
+        q = (block->ql[ql_base + lane] >> 4u) |
+            (((block->qh[qh_base + lane] >> 4u) & 3u) << 4u);
+        scale = block->scales[scale_base + lane / 16u + 4u];
+    } else {
+        q = (block->ql[ql_base + 32u + lane] >> 4u) |
+            (((block->qh[qh_base + lane] >> 6u) & 3u) << 4u);
+        scale = block->scales[scale_base + lane / 16u + 6u];
+    }
+    return dev_f16_to_f32(block->d) * (float)scale *
+           (float)((int32_t)q - 32);
+}
+
+/* Q6_K x Q8_K block dot.  The K-quant groups are not nibble-pairable like
+ * Q4_K, so this keeps one scalar multiply per element with the same per-term
+ * expression as the CPU reference; the exact accumulation order inside a
+ * block matches ds4_vec_dot_q6_K_q8_K's integer sum. */
+__device__ static float dev_dot_q6_K_q8_K_block(
+        const cuda_block_q6_K *x,
+        const cuda_block_q8_K *y) {
+    int isum = 0;
+#pragma unroll
+    for (uint32_t n128 = 0; n128 < CUDA_QK_K; n128 += 128u) {
+#pragma unroll
+        for (uint32_t l = 0; l < 32u; l++) {
+            const uint32_t ql_base = (n128 >> 7u) * 64u;
+            const uint32_t qh_base = (n128 >> 7u) * 32u;
+            const uint32_t sc_base = (n128 >> 7u) * 8u;
+            const int is = (int)(l / 16u);
+            const int q1 = ((int)(x->ql[ql_base + l + 0u] & 0x0Fu) |
+                            (((int)(x->qh[qh_base + l] >> 0u) & 3) << 4)) - 32;
+            const int q2 = ((int)(x->ql[ql_base + l + 32u] & 0x0Fu) |
+                            (((int)(x->qh[qh_base + l] >> 2u) & 3) << 4)) - 32;
+            const int q3 = ((int)(x->ql[ql_base + l + 0u] >> 4) |
+                            (((int)(x->qh[qh_base + l] >> 4u) & 3) << 4)) - 32;
+            const int q4 = ((int)(x->ql[ql_base + l + 32u] >> 4) |
+                            (((int)(x->qh[qh_base + l] >> 6u) & 3) << 4)) - 32;
+            isum += (int)x->scales[sc_base + is + 0u] * q1 *
+                    (int)y->qs[n128 + l + 0u];
+            isum += (int)x->scales[sc_base + is + 2u] * q2 *
+                    (int)y->qs[n128 + l + 32u];
+            isum += (int)x->scales[sc_base + is + 4u] * q3 *
+                    (int)y->qs[n128 + l + 64u];
+            isum += (int)x->scales[sc_base + is + 6u] * q4 *
+                    (int)y->qs[n128 + l + 96u];
+        }
+    }
+    return dev_f16_to_f32(x->d) * y->d * (float)isum;
 }
 
 __device__ __forceinline__ static int dev_q3_K_scale(
@@ -19522,6 +19626,371 @@ __global__ static void laguna_moe_down_q4K_sum_kernel(
         if (lane == 0u) total += acc;
     }
     if (lane == 0u) out[(uint64_t)tok * out_dim + row] = total;
+}
+
+/* Q6_K routed down projection.  Same per-token reduction shape as the Q4_K
+ * kernel (an 8-lane group accumulates one output row across every selected
+ * expert, then the quarter-warp tree finishes the sum) so the accumulation
+ * order matches the CPU reference per expert slot. */
+__global__ static void laguna_moe_down_q6K_sum_kernel(
+        float *out,
+        const char *down_base,
+        const cuda_block_q8_K *midq,
+        const int32_t *selected,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim,
+        uint32_t n_expert) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    const uint32_t tok = blockIdx.y;
+    if (row >= out_dim) return;
+    float total = 0.0f;
+    for (uint32_t slot = 0; slot < n_expert; slot++) {
+        int32_t expert_i =
+            selected[(uint64_t)tok * n_expert + slot];
+        if (expert_i < 0) expert_i = 0;
+        const cuda_block_q6_K *wr =
+            (const cuda_block_q6_K *)(down_base +
+                (uint64_t)(uint32_t)expert_i * down_expert_bytes +
+                (uint64_t)row * down_row_bytes);
+        const cuda_block_q8_K *xq =
+            midq + ((uint64_t)tok * n_expert + slot) * midq_blocks;
+        float acc = 0.0f;
+        for (uint32_t b = lane; b < midq_blocks; b += 8u) {
+            acc += dev_dot_q6_K_q8_K_block(wr + b, xq + b);
+        }
+        acc = quarter_warp_sum_f32(acc, lane);
+        if (lane == 0u) total += acc;
+    }
+    if (lane == 0u) out[(uint64_t)tok * out_dim + row] = total;
+}
+
+/* Q6_K routed gate/up projection for the all-Q6_K export.  Mirrors the Q3_K
+ * decode kernel: a half warp owns one mid row per pair, computes gate and up
+ * with the Q6_K dot and writes the routed SwiGLU product scaled by the router
+ * weight.  The tiled Q4_K/Q3_K prefills do not apply to Q6_K, so every batch
+ * size uses this kernel (exact, one pair per block). */
+__global__ static void laguna_moe_gate_up_q6K_kernel(
+        float *mid_out,
+        const char *gate_base,
+        const char *up_base,
+        const cuda_block_q8_K *xq,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert) {
+    const uint32_t lane = threadIdx.x & 15u;
+    const uint32_t row_lane = threadIdx.x >> 4u;
+    const uint32_t pair = blockIdx.y;
+    const uint32_t tok = pair / n_expert;
+    const uint32_t slot = pair - tok * n_expert;
+    int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+    if (expert_i < 0) expert_i = 0;
+    const uint32_t expert = (uint32_t)expert_i;
+    const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
+    __shared__ cuda_block_q8_K sxq[16];
+    if (xq_blocks <= 16u) {
+        for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) {
+            sxq[i] = xqb[i];
+        }
+        __syncthreads();
+        xqb = sxq;
+    }
+    for (uint32_t rr = 0; rr < 16u; rr++) {
+        const uint32_t row = blockIdx.x * 256u + row_lane + rr * 16u;
+        if (row >= expert_mid_dim) continue;
+        const cuda_block_q6_K *gr =
+            (const cuda_block_q6_K *)(gate_base +
+                (uint64_t)expert * gate_expert_bytes +
+                (uint64_t)row * gate_row_bytes);
+        const cuda_block_q6_K *ur =
+            (const cuda_block_q6_K *)(up_base +
+                (uint64_t)expert * gate_expert_bytes +
+                (uint64_t)row * gate_row_bytes);
+        float gate = 0.0f;
+        float up = 0.0f;
+        for (uint32_t b = lane; b < xq_blocks; b += 16u) {
+            gate += dev_dot_q6_K_q8_K_block(gr + b, xqb + b);
+            up += dev_dot_q6_K_q8_K_block(ur + b, xqb + b);
+        }
+        gate = half_warp_sum_f32(gate, lane);
+        up = half_warp_sum_f32(up, lane);
+        if (lane == 0u) {
+            const uint64_t off =
+                (uint64_t)pair * expert_mid_dim + row;
+            mid_out[off] =
+                (gate / (1.0f + expf(-gate))) * up *
+                weights[(uint64_t)tok * n_expert + slot];
+        }
+    }
+}
+
+/* Dense Q4_K/Q6_K matmul for the Laguna mixed exports (the dense layer's
+ * gate/up/down and the output head).  One block owns one output row and a
+ * tile of tokens; each thread accumulates over its strided slice of the
+ * input and the partials reduce in shared memory in a fixed order, matching
+ * the PR #594 reference kernels so the per-element dequantization is the
+ * only source of numerical difference from the CPU reference. */
+template <uint32_t TOKEN_TILE>
+__global__ static void laguna_matmul_q4_K_f32_kernel(
+        float *out,
+        const cuda_block_q4_K *weight,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t n_tokens) {
+    const uint64_t row = blockIdx.x;
+    const uint64_t token0 = (uint64_t)blockIdx.y * TOKEN_TILE;
+    if (row >= out_dim || token0 >= n_tokens) return;
+    const uint64_t row_blocks = in_dim / CUDA_QK_K;
+    const cuda_block_q4_K *wr = weight + row * row_blocks;
+    float sums[TOKEN_TILE] = {0.0f};
+    for (uint64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        const float wv = dev_q4_K_value(wr, (uint32_t)i);
+#pragma unroll
+        for (uint32_t t = 0; t < TOKEN_TILE; t++) {
+            if (token0 + t < n_tokens) {
+                sums[t] += wv * x[(token0 + t) * in_dim + i];
+            }
+        }
+    }
+    __shared__ float partial[TOKEN_TILE][256];
+#pragma unroll
+    for (uint32_t t = 0; t < TOKEN_TILE; t++) {
+        partial[t][threadIdx.x] = sums[t];
+    }
+    __syncthreads();
+    for (uint32_t stride = 128u; stride != 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+#pragma unroll
+            for (uint32_t t = 0; t < TOKEN_TILE; t++) {
+                partial[t][threadIdx.x] +=
+                    partial[t][threadIdx.x + stride];
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0u) {
+#pragma unroll
+        for (uint32_t t = 0; t < TOKEN_TILE; t++) {
+            if (token0 + t < n_tokens) {
+                out[(token0 + t) * out_dim + row] = partial[t][0];
+            }
+        }
+    }
+}
+
+template <uint32_t TOKEN_TILE>
+__global__ static void laguna_matmul_q6_K_f32_kernel(
+        float *out,
+        const cuda_block_q6_K *weight,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t n_tokens) {
+    const uint64_t row = blockIdx.x;
+    const uint64_t token0 = (uint64_t)blockIdx.y * TOKEN_TILE;
+    if (row >= out_dim || token0 >= n_tokens) return;
+    const uint64_t row_blocks = in_dim / CUDA_QK_K;
+    const cuda_block_q6_K *wr = weight + row * row_blocks;
+    float sums[TOKEN_TILE] = {0.0f};
+    for (uint64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        const float wv = dev_q6_K_value(wr, (uint32_t)i);
+#pragma unroll
+        for (uint32_t t = 0; t < TOKEN_TILE; t++) {
+            if (token0 + t < n_tokens) {
+                sums[t] += wv * x[(token0 + t) * in_dim + i];
+            }
+        }
+    }
+    __shared__ float partial[TOKEN_TILE][256];
+#pragma unroll
+    for (uint32_t t = 0; t < TOKEN_TILE; t++) {
+        partial[t][threadIdx.x] = sums[t];
+    }
+    __syncthreads();
+    for (uint32_t stride = 128u; stride != 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+#pragma unroll
+            for (uint32_t t = 0; t < TOKEN_TILE; t++) {
+                partial[t][threadIdx.x] +=
+                    partial[t][threadIdx.x + stride];
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0u) {
+#pragma unroll
+        for (uint32_t t = 0; t < TOKEN_TILE; t++) {
+            if (token0 + t < n_tokens) {
+                out[(token0 + t) * out_dim + row] = partial[t][0];
+            }
+        }
+    }
+}
+
+__global__ static void laguna_dequant_q4_K_f16_kernel(
+        __half *out,
+        const cuda_block_q4_K *weight,
+        uint64_t in_dim,
+        uint64_t values) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= values) return;
+    const uint64_t row = gid / in_dim;
+    const uint32_t col = (uint32_t)(gid - row * in_dim);
+    const uint64_t row_blocks = in_dim / CUDA_QK_K;
+    out[gid] = __float2half(dev_q4_K_value(weight + row * row_blocks, col));
+}
+
+__global__ static void laguna_dequant_q6_K_f16_kernel(
+        __half *out,
+        const cuda_block_q6_K *weight,
+        uint64_t in_dim,
+        uint64_t values) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= values) return;
+    const uint64_t row = gid / in_dim;
+    const uint32_t col = (uint32_t)(gid - row * in_dim);
+    const uint64_t row_blocks = in_dim / CUDA_QK_K;
+    out[gid] = __float2half(dev_q6_K_value(weight + row * row_blocks, col));
+}
+
+/* Q4_K/Q6_K dense matmul entry used by the Laguna graph's generic matmul
+ * dispatch.  Small token counts and quality mode keep the per-element
+ * reduction; larger batches dequantize one matrix at a time into the
+ * reusable scratch slab and use tensor-core GEMM. */
+static int cuda_laguna_matmul_k_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              weight_type,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t              n_tokens) {
+    if (!out || !x || !model_map || n_tokens == 0u ||
+        (in_dim & (CUDA_QK_K - 1u)) != 0u ||
+        in_dim > UINT32_MAX || out_dim > UINT32_MAX ||
+        n_tokens > UINT32_MAX ||
+        out_dim > UINT64_MAX / in_dim) {
+        return 0;
+    }
+    const uint64_t block_bytes = weight_type == 12u ?
+        sizeof(cuda_block_q4_K) :
+        weight_type == 14u ? sizeof(cuda_block_q6_K) : 0u;
+    if (block_bytes == 0u) return 0;
+    const uint64_t blocks_per_row = in_dim / CUDA_QK_K;
+    if (out_dim > UINT64_MAX / blocks_per_row ||
+        out_dim * blocks_per_row > UINT64_MAX / block_bytes) {
+        return 0;
+    }
+    const uint64_t weight_bytes =
+        out_dim * blocks_per_row * block_bytes;
+    if (weight_offset > model_size ||
+        weight_bytes > model_size - weight_offset ||
+        n_tokens > UINT64_MAX / in_dim ||
+        n_tokens * in_dim > UINT64_MAX / sizeof(float) ||
+        x->bytes < n_tokens * in_dim * sizeof(float) ||
+        n_tokens > UINT64_MAX / out_dim ||
+        n_tokens * out_dim > UINT64_MAX / sizeof(float) ||
+        out->bytes < n_tokens * out_dim * sizeof(float)) {
+        return 0;
+    }
+    const int logical_tier = ds4_tensor_device_idx(out);
+    if (ds4_tensor_device_idx(x) != logical_tier) return 0;
+    const char *weight = cuda_resolve_weight_ptr(
+            model_map, weight_offset, weight_bytes, logical_tier,
+            weight_type == 12u ? "Laguna Q4_K matrix" :
+                                 "Laguna Q6_K matrix");
+    if (!weight) return 0;
+
+    if (g_quality_mode || n_tokens < 4u || !g_cublas_ready) {
+        const dim3 grid((uint32_t)out_dim,
+                        (uint32_t)((n_tokens + 3u) / 4u), 1u);
+        if (weight_type == 12u) {
+            laguna_matmul_q4_K_f32_kernel<4><<<grid, 256>>>(
+                    (float *)out->ptr,
+                    (const cuda_block_q4_K *)weight,
+                    (const float *)x->ptr,
+                    in_dim, out_dim, n_tokens);
+        } else {
+            laguna_matmul_q6_K_f32_kernel<4><<<grid, 256>>>(
+                    (float *)out->ptr,
+                    (const cuda_block_q6_K *)weight,
+                    (const float *)x->ptr,
+                    in_dim, out_dim, n_tokens);
+        }
+        return cuda_ok(cudaGetLastError(),
+                       weight_type == 12u ?
+                       "Laguna Q4_K matmul launch" :
+                       "Laguna Q6_K matmul launch");
+    }
+
+    const uint64_t weight_values = out_dim * in_dim;
+    const uint64_t weight_f16_bytes = weight_values * sizeof(__half);
+    const uint64_t x_values = n_tokens * in_dim;
+    const uint64_t x_offset = (weight_f16_bytes + 255u) & ~255ull;
+    if (x_offset > UINT64_MAX - x_values * sizeof(__half)) return 0;
+    uint8_t *scratch = (uint8_t *)cuda_tmp_alloc_on(
+            logical_tier,
+            x_offset + x_values * sizeof(__half),
+            "Laguna quantized GEMM");
+    if (!scratch) return 0;
+    __half *weight_f16 = (__half *)scratch;
+    __half *x_f16 = (__half *)(scratch + x_offset);
+    const uint64_t dequant_blocks = (weight_values + 255u) / 256u;
+    if (dequant_blocks > UINT32_MAX) return 0;
+    if (weight_type == 12u) {
+        laguna_dequant_q4_K_f16_kernel<<<(uint32_t)dequant_blocks, 256>>>(
+                weight_f16,
+                (const cuda_block_q4_K *)weight,
+                in_dim,
+                weight_values);
+    } else {
+        laguna_dequant_q6_K_f16_kernel<<<(uint32_t)dequant_blocks, 256>>>(
+                weight_f16,
+                (const cuda_block_q6_K *)weight,
+                in_dim,
+                weight_values);
+    }
+    f32_to_f16_kernel<<<(x_values + 255u) / 256u, 256>>>(
+            x_f16, (const float *)x->ptr, x_values);
+    if (!cuda_ok(cudaGetLastError(),
+                 "Laguna quantized GEMM conversion launch")) {
+        return 0;
+    }
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    const cublasStatus_t status = cublasGemmEx(
+            cuda_cublas_for_tier(logical_tier),
+            CUBLAS_OP_T,
+            CUBLAS_OP_N,
+            (int)out_dim,
+            (int)n_tokens,
+            (int)in_dim,
+            &alpha,
+            weight_f16,
+            CUDA_R_16F,
+            (int)in_dim,
+            x_f16,
+            CUDA_R_16F,
+            (int)in_dim,
+            &beta,
+            out->ptr,
+            CUDA_R_32F,
+            (int)out_dim,
+            CUDA_R_32F,
+            CUBLAS_GEMM_DEFAULT);
+    return cublas_ok(status,
+                     weight_type == 12u ?
+                     "Laguna Q4_K matmul" :
+                     "Laguna Q6_K matmul");
 }
 
 __global__ static void laguna_moe_down_q3K_sum_kernel(
@@ -23972,6 +24441,28 @@ __global__ static void glm_embed_token_q8_0_kernel(
     out[d] = scale * (float)((const int8_t *)(blk + 2))[d & 31u];
 }
 
+__global__ static void laguna_embed_token_q4_K_kernel(
+        float *out,
+        const cuda_block_q4_K *w,
+        uint32_t token,
+        uint32_t n_embd) {
+    const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= n_embd) return;
+    const uint64_t row_blocks = n_embd / CUDA_QK_K;
+    out[d] = dev_q4_K_value(w + (uint64_t)token * row_blocks, d);
+}
+
+__global__ static void laguna_embed_token_q6_K_kernel(
+        float *out,
+        const cuda_block_q6_K *w,
+        uint32_t token,
+        uint32_t n_embd) {
+    const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= n_embd) return;
+    const uint64_t row_blocks = n_embd / CUDA_QK_K;
+    out[d] = dev_q6_K_value(w + (uint64_t)token * row_blocks, d);
+}
+
 extern "C" int ds4_gpu_embed_token_quant_tensor(
         ds4_gpu_tensor *out,
         const void       *model_map,
@@ -23985,12 +24476,17 @@ extern "C" int ds4_gpu_embed_token_quant_tensor(
         token >= n_vocab) {
         return 0;
     }
-    if (weight_type != 8u) {   /* DS4_TENSOR_Q8_0 */
+    if (weight_type != 8u && weight_type != 12u && weight_type != 14u) {
         fprintf(stderr, "ds4: embed_token_quant: unsupported type %u\n",
                 weight_type);
         return 0;
     }
-    const uint64_t row_bytes = ((uint64_t)n_embd / 32u) * 34u;
+    if (weight_type != 8u && (n_embd & 255u) != 0u) return 0;
+    const uint64_t row_bytes = weight_type == 8u ?
+        ((uint64_t)n_embd / 32u) * 34u :
+        weight_type == 12u ?
+        ((uint64_t)n_embd / CUDA_QK_K) * sizeof(cuda_block_q4_K) :
+        ((uint64_t)n_embd / CUDA_QK_K) * sizeof(cuda_block_q6_K);
     if (weight_offset > model_size ||
         (uint64_t)n_vocab * row_bytes > model_size - weight_offset ||
         out->bytes < (uint64_t)n_embd * sizeof(float)) {
@@ -24001,6 +24497,22 @@ extern "C" int ds4_gpu_embed_token_quant_tensor(
             model_map, weight_offset, (uint64_t)n_vocab * row_bytes,
             logical_tier, "glm_token_embd");
     if (!w) return 0;
+    if (weight_type == 12u) {
+        laguna_embed_token_q4_K_kernel<<<(n_embd + 255u) / 256u, 256>>>(
+                (float *)out->ptr,
+                (const cuda_block_q4_K *)w,
+                token,
+                n_embd);
+        return cuda_ok(cudaGetLastError(), "Laguna Q4_K embed token launch");
+    }
+    if (weight_type == 14u) {
+        laguna_embed_token_q6_K_kernel<<<(n_embd + 255u) / 256u, 256>>>(
+                (float *)out->ptr,
+                (const cuda_block_q6_K *)w,
+                token,
+                n_embd);
+        return cuda_ok(cudaGetLastError(), "Laguna Q6_K embed token launch");
+    }
     glm_embed_token_q8_0_kernel<<<(n_embd + 255) / 256, 256>>>(
             (float *)out->ptr, w, token, n_embd);
     return cuda_ok(cudaGetLastError(), "glm embed token launch");
@@ -24024,6 +24536,38 @@ __global__ static void glm_embed_tokens_q8_0_kernel(
     out[gid] = scale * (float)((const int8_t *)(blk + 2))[d & 31u];
 }
 
+__global__ static void laguna_embed_tokens_q4_K_kernel(
+        float *out,
+        const int32_t *tokens,
+        const cuda_block_q4_K *w,
+        uint32_t n_tokens,
+        uint32_t n_embd) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t values = (uint64_t)n_tokens * n_embd;
+    if (gid >= values) return;
+    const uint32_t token_row = (uint32_t)(gid / n_embd);
+    const uint32_t d = (uint32_t)(gid - (uint64_t)token_row * n_embd);
+    const uint64_t row_blocks = n_embd / CUDA_QK_K;
+    out[gid] = dev_q4_K_value(
+            w + (uint64_t)(uint32_t)tokens[token_row] * row_blocks, d);
+}
+
+__global__ static void laguna_embed_tokens_q6_K_kernel(
+        float *out,
+        const int32_t *tokens,
+        const cuda_block_q6_K *w,
+        uint32_t n_tokens,
+        uint32_t n_embd) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t values = (uint64_t)n_tokens * n_embd;
+    if (gid >= values) return;
+    const uint32_t token_row = (uint32_t)(gid / n_embd);
+    const uint32_t d = (uint32_t)(gid - (uint64_t)token_row * n_embd);
+    const uint64_t row_blocks = n_embd / CUDA_QK_K;
+    out[gid] = dev_q6_K_value(
+            w + (uint64_t)(uint32_t)tokens[token_row] * row_blocks, d);
+}
+
 extern "C" int ds4_gpu_embed_tokens_quant_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *tokens,
@@ -24038,12 +24582,17 @@ extern "C" int ds4_gpu_embed_tokens_quant_tensor(
         (n_embd & 31u) != 0u) {
         return 0;
     }
-    if (weight_type != 8u) {   /* DS4_TENSOR_Q8_0 */
+    if (weight_type != 8u && weight_type != 12u && weight_type != 14u) {
         fprintf(stderr, "ds4: embed_tokens_quant: unsupported type %u\n",
                 weight_type);
         return 0;
     }
-    const uint64_t row_bytes = ((uint64_t)n_embd / 32u) * 34u;
+    if (weight_type != 8u && (n_embd & 255u) != 0u) return 0;
+    const uint64_t row_bytes = weight_type == 8u ?
+        ((uint64_t)n_embd / 32u) * 34u :
+        weight_type == 12u ?
+        ((uint64_t)n_embd / CUDA_QK_K) * sizeof(cuda_block_q4_K) :
+        ((uint64_t)n_embd / CUDA_QK_K) * sizeof(cuda_block_q6_K);
     if (weight_offset > model_size ||
         (uint64_t)n_vocab * row_bytes > model_size - weight_offset ||
         out->bytes < (uint64_t)n_tokens * n_embd * sizeof(float) ||
@@ -24056,6 +24605,22 @@ extern "C" int ds4_gpu_embed_tokens_quant_tensor(
             logical_tier, "glm_token_embd");
     if (!w) return 0;
     uint64_t n = (uint64_t)n_tokens * n_embd;
+    if (weight_type == 12u) {
+        laguna_embed_tokens_q4_K_kernel<<<(n + 255u) / 256u, 256>>>(
+                (float *)out->ptr,
+                (const int32_t *)tokens->ptr,
+                (const cuda_block_q4_K *)w,
+                n_tokens, n_embd);
+        return cuda_ok(cudaGetLastError(), "Laguna Q4_K embed tokens launch");
+    }
+    if (weight_type == 14u) {
+        laguna_embed_tokens_q6_K_kernel<<<(n + 255u) / 256u, 256>>>(
+                (float *)out->ptr,
+                (const int32_t *)tokens->ptr,
+                (const cuda_block_q6_K *)w,
+                n_tokens, n_embd);
+        return cuda_ok(cudaGetLastError(), "Laguna Q6_K embed tokens launch");
+    }
     glm_embed_tokens_q8_0_kernel<<<(n + 255) / 256, 256>>>(
             (float *)out->ptr,
             (const int32_t *)tokens->ptr,
@@ -27191,6 +27756,7 @@ static int laguna_routed_moe_q34_batch(
         uint64_t up_offset,
         uint64_t down_offset,
         uint32_t weight_type,
+        uint32_t down_type,
         uint64_t gate_expert_bytes,
         uint64_t gate_row_bytes,
         uint64_t up_expert_bytes,
@@ -27209,10 +27775,21 @@ static int laguna_routed_moe_q34_batch(
         uint32_t mid_token_stride) {
     const bool q4k = weight_type == 12u;
     const bool q3k = weight_type == 11u;
+    const bool q6k = weight_type == 14u;
+    /* The down projection is dispatched separately: mixed exports keep Q4_K
+     * gate/up with a per-layer Q4_K or Q6_K down, and the all-Q6_K export
+     * uses Q6_K for all three. */
+    const bool down_q4k = down_type == 12u;
+    const bool down_q3k = down_type == 11u;
+    const bool down_q6k = down_type == 14u;
     const uint64_t pair_count64 = (uint64_t)n_tokens * n_expert;
     const uint64_t mid_values = pair_count64 * expert_mid_dim;
     const uint64_t out_values = (uint64_t)n_tokens * out_dim;
-    if ((!q4k && !q3k) || !out || !mid || !model_map || !selected ||
+    if ((!q4k && !q3k && !q6k) || (!down_q4k && !down_q3k && !down_q6k) ||
+        (q4k && !down_q4k && !down_q6k) ||
+        (q3k && !down_q3k) ||
+        (q6k && !down_q6k) ||
+        !out || !mid || !model_map || !selected ||
         !weights || !x || n_tokens == 0u || n_total_expert == 0u ||
         n_expert == 0u || n_expert > n_total_expert ||
         pair_count64 > UINT32_MAX ||
@@ -27250,7 +27827,8 @@ static int laguna_routed_moe_q34_batch(
         q4k ? "Laguna Q4 up experts" : "Laguna Q3 up experts");
     const char *dw = (const char *)cuda_resolve_weight_ptr(
         model_map, down_offset, down_bytes, logical_tier,
-        q4k ? "Laguna Q4 down experts" : "Laguna Q3 down experts");
+        down_q4k ? "Laguna Q4 down experts" :
+        down_q6k ? "Laguna Q6 down experts" : "Laguna Q3 down experts");
     if (!gw || !uw || !dw) return 0;
 
     {
@@ -27428,6 +28006,17 @@ static int laguna_routed_moe_q34_batch(
                 gate_expert_bytes, gate_row_bytes,
                 xq_blocks, expert_mid_dim, n_expert);
         }
+    } else if (weight_type == 14u) {
+        /* All-Q6_K export: no tiled kernels, the exact per-pair kernel runs
+         * at every batch size. */
+        const dim3 gate_grid(
+            (expert_mid_dim + 255u) / 256u, pair_count, 1);
+        laguna_moe_gate_up_q6K_kernel<<<gate_grid, 256>>>(
+            (float *)mid->ptr, gw, uw, xq,
+            (const int32_t *)selected->ptr,
+            (const float *)weights->ptr,
+            gate_expert_bytes, gate_row_bytes,
+            xq_blocks, expert_mid_dim, n_expert);
     } else if (q4k) {
         const dim3 gate_grid(
             (expert_mid_dim + MOE_DECODE_ROWS_PER_BLOCK - 1u) /
@@ -27469,7 +28058,7 @@ static int laguna_routed_moe_q34_batch(
                      "Laguna tiled output clear")) {
             return 0;
         }
-        if (tiled_q4) {
+        if (tiled_q4 && down_q4k) {
             const dim3 down_grid(
                 (out_dim + 511u) / 512u, tile_capacity, 1);
             moe_down_q4K_expert_tile8_rowspan_kernel<512>
@@ -27479,6 +28068,17 @@ static int laguna_routed_moe_q34_batch(
                     tile_total, tile_experts, tile_starts,
                     down_expert_bytes, down_row_bytes,
                     midq_blocks, out_dim, n_expert, 1u);
+        } else if (tiled_q4 && down_q6k) {
+            /* Q6_K down has no expert-tile kernel; run the exact per-token
+             * down over every routed pair.  The tiled output was cleared, so
+             * this plain store kernel simply overwrites it. */
+            const dim3 down_grid(
+                (out_dim + 31u) / 32u, n_tokens, 1);
+            laguna_moe_down_q6K_sum_kernel<<<down_grid, 256>>>(
+                (float *)out->ptr, dw, midq,
+                (const int32_t *)selected->ptr,
+                down_expert_bytes, down_row_bytes,
+                midq_blocks, out_dim, n_expert);
         } else {
             const dim3 down_grid(
                 (out_dim + 7u) / 8u, n_total_expert, 1);
@@ -27491,8 +28091,14 @@ static int laguna_routed_moe_q34_batch(
     } else {
         const dim3 down_grid(
             (out_dim + 31u) / 32u, n_tokens, 1);
-        if (q4k) {
+        if (down_q4k) {
             laguna_moe_down_q4K_sum_kernel<<<down_grid, 256>>>(
+                (float *)out->ptr, dw, midq,
+                (const int32_t *)selected->ptr,
+                down_expert_bytes, down_row_bytes,
+                midq_blocks, out_dim, n_expert);
+        } else if (down_q6k) {
+            laguna_moe_down_q6K_sum_kernel<<<down_grid, 256>>>(
                 (float *)out->ptr, dw, midq,
                 (const int32_t *)selected->ptr,
                 down_expert_bytes, down_row_bytes,
@@ -27556,11 +28162,16 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
         (expert_in_dim & 255u) != 0u || (expert_mid_dim & 255u) != 0u) {
         return 0;
     }
-    if ((gate_type == 11u || gate_type == 12u) &&
-        up_type == gate_type && down_type == gate_type) {
+    /* Mixed exports keep a coherent gate/up family (Q4_K or Q3_K) but may
+     * pair Q4_K gate/up with a Q6_K down, and the all-Q6_K export uses Q6_K
+     * for all three.  Everything else stays unsupported. */
+    if ((gate_type == 11u || gate_type == 12u || gate_type == 14u) &&
+        up_type == gate_type &&
+        (down_type == gate_type ||
+         (gate_type == 12u && down_type == 14u))) {
         return laguna_routed_moe_q34_batch(
             out, mid, model_map, model_size,
-            gate_offset, up_offset, down_offset, gate_type,
+            gate_offset, up_offset, down_offset, gate_type, down_type,
             gate_expert_bytes, gate_row_bytes,
             up_expert_bytes, up_row_bytes,
             down_expert_bytes, down_row_bytes,
@@ -28639,6 +29250,11 @@ extern "C" int ds4_gpu_matmul_quant_tensor(
         return ds4_gpu_matmul_f16_tensor(out, model_map, model_size,
                                          weight_offset, in_dim, out_dim,
                                          x, n_tok);
+    case 12u:  /* Q4_K */
+    case 14u:  /* Q6_K */
+        return cuda_laguna_matmul_k_tensor(out, model_map, model_size,
+                                           weight_offset, weight_type,
+                                           in_dim, out_dim, x, n_tok);
     default:
         fprintf(stderr, "ds4: matmul_quant: unsupported type %u\n",
                 weight_type);
@@ -29566,9 +30182,9 @@ extern "C" int ds4_gpu_matmul_q6_K_tensor(
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
         const ds4_gpu_tensor *x, uint64_t n_tok) {
-    (void)out; (void)model_map; (void)model_size; (void)weight_offset;
-    (void)in_dim; (void)out_dim; (void)x; (void)n_tok;
-    return 0;
+    return cuda_laguna_matmul_k_tensor(
+            out, model_map, model_size, weight_offset, 14u,
+            in_dim, out_dim, x, n_tok);
 }
 
 extern "C" int ds4_gpu_laguna_routed_shared_moe_one_tensor(
