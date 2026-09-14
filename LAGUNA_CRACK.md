@@ -92,13 +92,23 @@ Notes:
 ## Getting the tree / updating it
 
 The canonical dev tree is `/data/ds4_clone` on the workstation (branch
-`laguna-crack`); the copy here was made with:
+`laguna-crack`). To update the copy on this box after new commits, sync
+from the workstation with the gitignore filter, which keeps the
+workstation's x86-64 build outputs out of the transfer:
 
-    rsync -a --exclude=graphify-rs-out/ /data/ds4_clone/ \
+    rsync -a --filter=':- .gitignore' --exclude=graphify-rs-out/ \
+      /data/ds4_clone/ \
       /run/user/1000/gvfs/sftp:host=192.168.1.91,user=leandro/home/leandro/ds4-laguna-crack/
 
-Re-run that after new commits on the workstation. The branch is not
-pushed to the upstream remote (`antirez/ds4` is read-only for us).
+The workstation is x86-64 and this box is ARM64: a `./ds4` binary copied
+across fails with `cannot execute binary file: Exec format error`. The
+filter excludes `ds4`, `ds4-server`, `ds4-agent`, `ds4-bench`,
+`ds4-eval`, `*.o` and the test binaries, so the tree here stays
+source-only; always build on this box. (The first copy of this tree did
+carry the workstation binaries; they were removed 2026-09-14.)
+
+The branch is not pushed to the upstream remote (`antirez/ds4` is
+read-only for us).
 
 ## What is verified and what is not
 
