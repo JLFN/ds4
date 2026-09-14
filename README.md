@@ -188,6 +188,15 @@ systems. The current Q8_0-signal Q4_K_M and mixed Q2_K/Q3_K layouts run on
 Metal, CUDA, and ROCm. Linux validation covers NVIDIA GB10 in DGX Spark and the
 Ryzen AI Max+ 395 / Radeon 8060S (`gfx1151`) in Strix Halo.
 
+The community CRACK exports (`laguna-crack-q4`, `laguna-crack-q6`,
+`laguna-crack-q2`) use a third mixed layout: Q4_K or Q6_K embedding and dense
+experts, Q8_0 attention and shared experts, routed gate/up in Q4_K or Q6_K,
+routed down in Q4_K, Q6_K or a per-layer mix, a Q6_K output head, and a
+1M-context YaRN rope. The `laguna-crack` branch accepts these on CUDA and the
+`laguna-crack-q4` file (67.75 GiB) is the one verified on this branch; it
+fits a 128 GB DGX Spark with the sliding-window KV active (36 of 48 layers
+keep a 512-token window, so 262144 context costs about 12 GiB of KV).
+
 CLI, agent, and server use Laguna's native chat, interleaved reasoning, and
 tagged tool-call formats:
 
