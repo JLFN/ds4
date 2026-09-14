@@ -13,6 +13,20 @@ in a per-layer Q4_K/Q6_K mix, Q6_K output head, 1M-context YaRN rope
 same hybrid with all-Q6_K experts and is also accepted, but only the
 Q4_K_M file is verified end to end so far.
 
+## Quick start (one line)
+
+Everything in one paste — builds if needed, then generates a haiku:
+
+    cd ~/ds4-laguna-crack && make cuda-spark && ./ds4 --cuda -m /home/leandro/models/Laguna-S-2.1-CRACK-Q4_K_M.gguf -c 32768 -p "Write a haiku about mountains." -n 32
+
+After the first build, the short form:
+
+    cd ~/ds4-laguna-crack && ./ds4 --cuda -m /home/leandro/models/Laguna-S-2.1-CRACK-Q4_K_M.gguf -c 32768 -p "Write a haiku about mountains." -n 32
+
+The weights (67.75 GiB) take a minute or two to load; then a line like
+`ds4: Laguna GPU graph: ctx=32768, KV ... GiB` appears, followed by the
+generated text.
+
 ## Steps
 
 Run everything on the DGX Spark, from the tree copied to `~/ds4-laguna-crack`.
