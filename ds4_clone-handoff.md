@@ -1,7 +1,7 @@
 ---
 project: ds4-laguna-crack
 plan_start_commit: 448d5695d1c86401a4e9447c440feb983b73e6de
-last_updated_commit: c8cfb5ee590bf9ff9d0ced07866d63b0779d47fe
+last_updated_commit: 0285c6328b76ca8d1627a6ac9116bc9c13443014
 branch: laguna-crack
 remote: https://github.com/antirez/ds4.git
 handoff_written_at_context_usage: 20%
@@ -33,94 +33,92 @@ commit set.
 
 2. Current state (2026-09-14 — COMPLETE, verified)
 
-- Work tree: /data/ds4_clone (branch laguna-crack, clean, 4 commits on
+- Work tree: /data/ds4_clone (branch laguna-crack, clean, 6 commits on
   top of the branch point 448d569).
 - The CRACK mixed-quant CUDA support is implemented, built, unit-verified
-  and copied to the GX10 box as ~/ds4-laguna-crack (git history included,
-  HEAD f45d5f4; verified over the sftp mount 2026-09-14T18:13).
-- Unit 1 (commits 6670ce7, df2b7ff, b2bcc7d, f45d5f4):
-  - ds4.c: metadata-driven rope adoption (context_length == orig_ctx *
-    factor, bounded factor/attn checks) and the new mixed-layout
-    validation (Q6_K embedding marker; attn/shexp family probing; Q4_K or
-    Q6_K dense gate/up; Q4_K/Q3_K/Q2_K/Q6_K routed gate/up with coherent
-    gate/up and Q4_K-or-Q6_K down).
-  - ds4_cuda.cu: cuda_block_q6_K + assert; dev_q4_K_value/dev_q6_K_value/
-    dev_dot_q6_K_q8_K_block; Q4_K/Q6_K token embedding kernels + dispatch;
-    laguna_moe_gate_up_q6K_kernel + laguna_moe_down_q6K_sum_kernel;
-    q34_batch takes down_type; laguna_matmul_q4_K_f32/_q6_K_f32 kernels
-    with dequant+GEMM path (cuda_laguna_matmul_k_tensor), wired into
-    ds4_gpu_matmul_q6_K_tensor and matmul_quant.
-  - tests/test_laguna_crack_kernels.c + make target: 18/18 PASS on the
-    RTX 4070 (sm_89), worst=0.000 of tolerance (bit-exact vs CPU refs).
-- Pre-verified for the DGX: full sm_121 build (make cuda CUDA_ARCH=sm_121)
-  links all five binaries cleanly in a scratch copy.
-- Model facts (from GGUF headers, both saved in /data/ds4_crack_refs/):
-  Q4_K_M 72,748,281,728 B (on the box, loads past every gate; local run
-  stops only on the 4070's 12 GB), Q6_K 97,346,154,368 B, Q2_K
-  45,099,593,600 B.
-- KV sizing (per ds4.c:47946): 36/48 layers keep a 512-token sliding
-  window, so KV = 12.07 GiB at 262144 ctx, 48.07 GiB at 1048576.
+  and copied to the GX10 box as ~/ds4-laguna-crack (HEAD 0285c63).
+- FIRST REAL RUN SUCCEEDED on the box (2026-09-14): build via
+  make cuda-spark, then a 49-token prompt generated a coherent haiku at
+  prefill 41.17 t/s / generation 22.05 t/s on the GB10 (sm_121), with
+  KV 1.57 GiB and scratch 5862 MiB at ctx 32768. So the port works on
+  real weights.
+- Unit 2 (commit 0285c63) fixed the long-prefill bug the first server
+  run exposed: a 51415-token prompt died after 1/48 layers with "CUDA
+  Laguna routed MoE intermediate quantize launch failed: invalid
+  argument". Cause: the routed MoE quantizes n_tokens * n_expert rows
+  and the Q6_K gate/up launches one block per pair, both on blockIdx.y,
+  which CUDA caps at 65535 (16384-token chunk x 10 experts = 163840).
+  Fix: the three q8_K quantizers and the Q6_K gate/up kernel fold
+  blockIdx.z into the row/pair index, with q8_K_row_grid()/launch
+  helpers. Prompts longer than ~6553 tokens were affected; short ones
+  were not, which is why the smoke test passed.
+- Verification: make test-laguna-crack-kernels now 27/27 PASS including
+  three large-batch cases at pair_count=80000 (past the cap, bit-exact
+  vs CPU refs); make q4k-dot-test 4/4; all five binaries build.
+- Model facts (GGUF headers, inventories in /data/ds4_crack_refs/):
+  Q4_K_M 72,748,281,728 B (the file on the box), Q6_K 97,346,154,368 B,
+  Q2_K 45,099,593,600 B.
+- KV sizing (ds4.c:47946): 36/48 layers keep a 512-token window, so KV
+  = 1.57 GiB at 32768 ctx and 48.07 GiB at 1048576. Measured on the box:
+  32768 ctx plans 69.32 GiB total (67.75 model + 1.57 KV) plus 5.86 GiB
+  scratch. One caveat: the engine allocates the graph and the server may
+  also hold its own copy, so 1M needs about 121.6 GiB and does not fit
+  the box's ~115-118 GiB usable; the practical ceiling is roughly 800k
+  context. Recommended default 262144.
 - /data/ds4 (original) untouched: main @ a04f46f.
 
-3. Next unit plan — DGX verification run (2026-09-14)
+3. Next unit plan — long-context confirmation and speed (2026-09-14)
 
-Goal: prove the CRACK Q4_K_M file generates correct text on the GB10 and
-leave a working server. Status: not yet started; the tree is already on
-the box at ~/ds4-laguna-crack (all phases below run ON the box).
+Goal: confirm the grid fix on the box with the exact prompt that failed,
+then decide the context default and the speed path.
 
-Ground truth first (reference-implementation rule): the user's llama.cpp
-on the box runs this exact file (engine per ~/models/README.md is
-mainline llama.cpp; /data/DGX_lagunaS21/LAGUNA_GX10_SETUP.md says the
-DFlash draft needs poolside's fork — verify which build is current
-before relying on either as the reference).
-
-Phase A — build on the box
+Phase A — rebuild and unit-test on the box
   cd ~/ds4-laguna-crack
-  make cuda-spark            # GB10; forces a clean rebuild, no -arch
-  Expected: ds4, ds4-server, ds4-agent, ds4-bench, ds4-eval built; the
-  Makefile's CUDA_HOME default (/usr/local/cuda) matches the box.
-  Acceptance: all five binaries exist; `./ds4 --help` prints.
+  make cuda-spark
+  make test-laguna-crack-kernels        # expect 27/27 PASS
+  Acceptance: zero failures; the three "large batch ... pair_count=80000"
+  lines all print ok.
 
-Phase B — kernel test + load check
-  make test-laguna-crack-kernels     # expect 18/18 PASS, 0 failures
-  ./ds4 --inspect -m /home/leandro/models/Laguna-S-2.1-CRACK-Q4_K_M.gguf
-  Expected: exit 0, arch laguna, 814 tensors, types f32/q8_0/q4_k/q6_k,
-  file size 67.75 GiB. (Same output already verified from the workstation
-  over the mount; this re-verifies the aarch64 build's own binary.)
+Phase B — the regression that mattered
+  Stop any running server, then rerun the request that failed: a long
+  prompt (>6553 tokens; the failure was at 51415). Watch for "routed MoE
+  intermediate quantize launch failed" — it must NOT appear, and prefill
+  must complete past layer 1.
+  Acceptance: the server answers; the log shows no "failed in routed
+  experts".
 
-Phase C — generation smoke
-  ./ds4 --cuda -m /home/leandro/models/Laguna-S-2.1-CRACK-Q4_K_M.gguf \
-    -c 32768 -p "Write a haiku about mountains." -n 32
-  Acceptance: coherent output (not loops/garbage — the Q6_K-misalignment
-  failure mode is degenerate repetition, so read the text, do not just
-  check exit status). Compare against llama.cpp on the same prompt if in
-  doubt. Watch stderr for the "Laguna GPU graph: ctx=... KV ..." line.
-  If it OOMs at 262144, retry at 32768 first (12 GB is enough for the
-  graph at that ctx; the weights still need 67.75 GiB resident).
+Phase C — decide the context default
+  The CRACK export declares context_length 1048576 and the engine adopts
+  it, so -c up to 1048576 is accepted. Measured ceiling on the box: the
+  model is 67.75 GiB resident, scratch is fixed at ~5.9 GiB (prefill cap
+  16384), and KV costs 49,152 bytes per token (12 layers full + 36 at a
+  512 window). 1M needs ~121.6 GiB and does not fit ~115-118 GiB usable;
+  about 800k is the practical ceiling. Test upward (e.g. 262144 -> 524288
+  -> 786432) and keep the highest that starts cleanly; default 262144.
+  Note: prefill is chunked at 16384, so use the server for 1M-class
+  prompts rather than one huge CLI prompt.
 
-Phase D — serve
-  ./start-laguna-crack-ds4.sh start   # ds4-server --cuda on :8002
-  curl -s http://127.0.0.1:8002/v1/models    # alias laguna-s-2.1
-  Compare with the workstation's open-grok model entry
-  laguna-s-2-1-crack (base_url http://192.168.1.91:8002/v1, currently
-  served by llama.cpp; switching it to this server is the end goal).
-  Note: the old start-ds4-laguna.sh in ~ uses llama.cpp flags; it does
-  not apply to ds4-server. Do not use it.
-
-Phase E — record and close
-  Record evidence (numbers, sample output) in the commit that closes the
-  unit ("Unit: 2 complete" trailer), update this handoff's section 2, and
-  if the box is reachable from open-grok, note the swap in memory.
+Phase D — speed (measure before changing code)
+  Known levers, in order:
+  1. DFlash speculative decoding: fetch poolside's draft with
+     ./download_model.sh laguna-dflash (laguna-s-2.1-DFlash-Q8_0.gguf,
+     1.11 GiB, verified present in the antirez Laguna repo), then pass
+     --dflash <file> (CUDA default --dflash-draft 15). This is the main
+     decode lever and is untested here.
+  2. Prefill: the review found the mixed-down layers (23 of 47 in the
+     Q4_K_M file) pay the full tiled expert setup in prefill and then
+     re-run the down projection per token; and laguna_routed_moe_tc_prefill
+     only accepts Q2_K/Q3_K, so the CRACK files never use the tensor-core
+     path. Both are code changes in ds4_cuda.cu.
+  Measure with ds4-bench (--ctx-start/--ctx-max/--gen-tokens, --csv) and
+  record numbers in the closing commit.
 
 Notes/decisions:
-- speed numbers for the CRACK file on GB10 are unknown; capture prefill
-  and decode t/s from the server log or ds4-bench as part of phase C/D.
-- DFlash: the draft file laguna-s-2.1-DFlash-Q4_K.gguf is NOT on the box
-  (checked 2026-09-14). If wanted, fetch poolside's Q8_0 draft via the
-  branch's ./download_model.sh laguna-dflash (antirez repo) — the ds4
-  DFlash needs the antirez Q8_0 file, not the Myric Q4_K one.
-- Q6_K is untested end-to-end (only its kernels are covered); it fits
-  the box (90.66 GiB + 12.07 KV at 262144) if the user wants it later.
+- Do NOT pass --prefill-chunk or --power below 100 for Laguna: the engine
+  rejects them ("standard local graph path only"). SSD streaming is also
+  rejected for Laguna. The only flag-level speed lever is DFlash.
+- The Q6_K CRACK export (90.66 GiB) fits only at small context now that
+  the real KV math is known; Q4_K_M is the right file for this box.
 
 4. Project facts a fresh session cannot re-derive
 
