@@ -24,6 +24,13 @@ GLM_ANTIREZ_Q4_FILE="GLM-5.2-UD-Q4_K_RoutedQ4K.gguf"
 LAGUNA_Q4_FILE="laguna-s-2.1-Q4_K_M.gguf"
 LAGUNA_Q2_Q3_FILE="laguna-s-2.1-RoutedQ2_K-Last27Q3_K.gguf"
 LAGUNA_DFLASH_FILE="laguna-s-2.1-DFlash-Q8_0.gguf"
+# Community CRACK exports (dealignai): Q4_K/Q6_K/Q2_K mixed recipes that
+# this branch accepts on CUDA (Q8_0 attention and shared experts, mixed
+# dense and routed experts, 1M-context yarn rope).
+LAGUNA_CRACK_REPO="dealignai/Laguna-S-2.1-CRACK-GGUF"
+LAGUNA_CRACK_Q4_FILE="Laguna-S-2.1-CRACK-Q4_K_M.gguf"
+LAGUNA_CRACK_Q6_FILE="Laguna-S-2.1-CRACK-Q6_K.gguf"
+LAGUNA_CRACK_Q2_FILE="Laguna-S-2.1-CRACK-Q2_K.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${DS4_GGUF_DIR:-"$ROOT/gguf"}
@@ -55,6 +62,9 @@ Usage:
   ./download_model.sh laguna-q4 [--token TOKEN]
   ./download_model.sh laguna-q2-q3 [--token TOKEN]
   ./download_model.sh laguna-dflash [--token TOKEN]
+  ./download_model.sh laguna-crack-q4 [--token TOKEN]
+  ./download_model.sh laguna-crack-q6 [--token TOKEN]
+  ./download_model.sh laguna-crack-q2 [--token TOKEN]
 
 Targets:
 
@@ -128,6 +138,20 @@ Targets:
        Q8_0 Laguna S 2.1 DFlash speculative support GGUF, quantized from
        Poolside's official support model. About 1.04 GiB on disk. This is an
        optional support model and does not replace or relink the main model.
+
+  laguna-crack-q4
+       Community CRACK Q4_K_M export (dealignai). Mixed recipe: Q4_K
+       embedding and dense/routed gate/up, Q8_0 attention and shared
+       experts, Q6_K output and mixed Q4_K/Q6_K routed down, 1M-context
+       yarn rope. About 68 GiB; accepted on CUDA by this branch. The file
+       the DGX Spark box already holds (byte-identical, 72,748,281,728).
+
+  laguna-crack-q6
+       Community CRACK Q6_K export, same hybrid with all-Q6_K experts.
+       About 91 GiB; fits a 128 GB DGX Spark at small context only.
+
+  laguna-crack-q2
+       Community CRACK Q2_K export, about 42 GiB; for smaller machines.
 
 Options:
   --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF token
@@ -222,6 +246,21 @@ case "$MODEL" in
         MODEL_FILE=$LAGUNA_DFLASH_FILE
         FORCE_HF_DOWNLOAD=1
         LINK_MODEL=0
+        ;;
+    laguna-crack-q4)
+        REPO=$LAGUNA_CRACK_REPO
+        MODEL_FILE=$LAGUNA_CRACK_Q4_FILE
+        FORCE_HF_DOWNLOAD=1
+        ;;
+    laguna-crack-q6)
+        REPO=$LAGUNA_CRACK_REPO
+        MODEL_FILE=$LAGUNA_CRACK_Q6_FILE
+        FORCE_HF_DOWNLOAD=1
+        ;;
+    laguna-crack-q2)
+        REPO=$LAGUNA_CRACK_REPO
+        MODEL_FILE=$LAGUNA_CRACK_Q2_FILE
+        FORCE_HF_DOWNLOAD=1
         ;;
     -h|--help|help)
         usage
