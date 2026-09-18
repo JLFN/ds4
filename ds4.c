@@ -6980,21 +6980,22 @@ static void config_read_qwen4_u64_array(
     *n_out = (uint32_t)arr.len;
 }
 
-static float g_qwen4_rope_freq[32];
-static float g_qwen4_rope_mscale = 1.0f;
-static uint32_t g_qwen4_native_ctx = 0;
-static bool g_qwen4_rope_yarn = false;
+/* Largest n_rot/2 either qwen family uses (both rotate 64 of the head dims). */
+#define DS4_MAX_ROT_PAIRS 32
 
-/* Rotary inverse frequencies of the DS4_N_ROT/2 pairs.  DS4_QWEN4_YARN_FACTOR=f
- * (f > 1) applies static YaRN over the native context (HF
- * _compute_yarn_parameters with beta_fast 32 / beta_slow 1), the model card's
- * recipe for prompts beyond 262k tokens; it costs some quality on short text,
- * so it stays off unless asked for. */
-static void qwen4_rope_configure(uint32_t native_ctx) {
-    const uint32_t n_rot = DS4_N_ROT, half = n_rot / 2u;
-    const double base = DS4_ROPE_FREQ_BASE;
-    const char *env = getenv("DS4_QWEN4_YARN_FACTOR");
-    const double factor = env ? atof(env) : 0.0;
+static float g_ds4_rope_freq[DS4_MAX_ROT_PAIRS];
+static float g_ds4_rope_mscale = 1.0f;
+static uint32_t g_ds4_rope_native_ctx = 0;
+static bool g_ds4_rope_yarn = false;
+
+/* Rotary inverse frequencies of the n_rot/2 rotated pairs, shared by the qwen
+ * families.  A factor > 1 applies static YaRN over the native context (HF
+ * _compute_yarn_parameters with beta_fast 32 / beta_slow 1); it costs some
+ * quality on short text, so the qwen4exp knob that sets it stays off unless
+ * asked for. */
+static void ds4_rope_configure(uint32_t n_rot, double base, uint32_t native_ctx, double factor) {
+    const uint32_t half = n_rot / 2u;
+    if (half == 0 || half > DS4_MAX_ROT_PAIRS) ds4_die("unsupported rope dimension count");
     const bool yarn = factor > 1.0 && native_ctx > 0;
     double low = 0.0, high = 0.0;
     if (yarn) {
@@ -7002,24 +7003,30 @@ static void qwen4_rope_configure(uint32_t native_ctx) {
         high = fmin((double)n_rot - 1.0, ceil(n_rot * log(native_ctx / (2.0 * M_PI)) / (2.0 * log(base))));
         if (high == low) high += 0.001;
     }
-    for (uint32_t i = 0; i < 32u; i++) {
+    for (uint32_t i = 0; i < DS4_MAX_ROT_PAIRS; i++) {
         double f = i < half ? pow(base, -2.0 * (double)i / (double)n_rot) : 0.0;
         if (yarn && i < half) {
             const double extrap = 1.0 - fmin(1.0, fmax(0.0, ((double)i - low) / (high - low)));
             f = (f / factor) * (1.0 - extrap) + f * extrap;
         }
-        g_qwen4_rope_freq[i] = (float)f;
+        g_ds4_rope_freq[i] = (float)f;
     }
-    g_qwen4_rope_mscale = yarn ? (float)(0.1 * log(factor) + 1.0) : 1.0f;
-    g_qwen4_native_ctx = native_ctx;
-    g_qwen4_rope_yarn = yarn;
+    g_ds4_rope_mscale = yarn ? (float)(0.1 * log(factor) + 1.0) : 1.0f;
+    g_ds4_rope_native_ctx = native_ctx;
+    g_ds4_rope_yarn = yarn;
     if (yarn) {
-        fprintf(stderr, "ds4: Qwen3.8 YaRN factor %g over %u native tokens (pairs %g..%g blended, mscale %.4f)\n",
-                factor, native_ctx, low, high, g_qwen4_rope_mscale);
+        fprintf(stderr, "ds4: YaRN factor %g over %u native tokens (pairs %g..%g blended, mscale %.4f)\n",
+                factor, native_ctx, low, high, g_ds4_rope_mscale);
     }
 #ifdef DS4_HAS_QWEN4_GPU
-    ds4_gpu_qwen4_set_rope(g_qwen4_rope_freq, half, g_qwen4_rope_mscale);
+    ds4_gpu_qwen4_set_rope(g_ds4_rope_freq, half, g_ds4_rope_mscale);
 #endif
+}
+
+static void qwen4_rope_configure(uint32_t native_ctx) {
+    const char *env = getenv("DS4_QWEN4_YARN_FACTOR");
+    const double factor = env ? atof(env) : 0.0;
+    ds4_rope_configure(DS4_N_ROT, DS4_ROPE_FREQ_BASE, native_ctx, factor);
 }
 
 static void config_validate_qwen4_model(const ds4_model *m) {
@@ -57329,7 +57336,7 @@ static int generate_glm_metal_argmax(
 }
 #endif
 
-static void qwen4_ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row, float *out);
+static void ds4_ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row, float *out);
 static void qwen4_ple_step(int token, int *prev, uint32_t *rows);
 
 static bool qwen4_ngram_row(const ds4_model *m, uint32_t row, float *out) {
@@ -57892,10 +57899,10 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
     g->n_logit_rows = mtp ? 3u : 1u;
     g->n_block_cap = ctx_cap / 4u + 1u;
     static bool warned_ctx = false;
-    if (!warned_ctx && g_qwen4_native_ctx && ctx_cap > g_qwen4_native_ctx && !g_qwen4_rope_yarn) {
+    if (!warned_ctx && g_ds4_rope_native_ctx && ctx_cap > g_ds4_rope_native_ctx && !g_ds4_rope_yarn) {
         warned_ctx = true;
         fprintf(stderr, "ds4: context %u exceeds the native %u tokens; prompts past that need "
-                "DS4_QWEN4_YARN_FACTOR (see README)\n", ctx_cap, g_qwen4_native_ctx);
+                "DS4_QWEN4_YARN_FACTOR (see README)\n", ctx_cap, g_ds4_rope_native_ctx);
     }
     g->sel_stride = g->k_blocks * 4u + 4u;
 
@@ -58664,7 +58671,7 @@ static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m,
         float *dst = row + (uint64_t)t * hc_dim;
         const float *img = n_spans ? qwen4_span_row(spans, n_spans, g->pos + t) : NULL;
         if (img) memcpy(dst, img, E * sizeof(float));
-        else qwen4_ref_row(m, w->token_embd, (uint64_t)tokens[t], dst);
+        else ds4_ref_row(m, w->token_embd, (uint64_t)tokens[t], dst);
         for (uint32_t s = 1; s < hc; s++) memcpy(dst + (uint64_t)s * E, dst, E * sizeof(float));
         qwen4_mrope_pos(spans, n_spans, g->pos + t, &g->mrope_delta, g->host_pos3 + (uint64_t)t * 4u);
         g->host_pos3[(uint64_t)t * 4u + 3u] = 0;
@@ -59038,7 +59045,7 @@ static bool qwen4_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
     const ds4_layer_weights *l = &w->layer[il];
     for (uint32_t t = 0; t < T; t++) {
         if (next_tokens[t] < 0 || next_tokens[t] >= (int)DS4_N_VOCAB) return false;
-        qwen4_ref_row(m, w->token_embd, (uint64_t)next_tokens[t], g->host_row + (uint64_t)t * E);
+        ds4_ref_row(m, w->token_embd, (uint64_t)next_tokens[t], g->host_row + (uint64_t)t * E);
     }
     if (!ds4_gpu_tensor_write(g->mtp_e, 0, g->host_row, (uint64_t)T * E * sizeof(float)) ||
         !glm_graph_begin_commands_if_needed()) return false;
@@ -59132,7 +59139,7 @@ static bool qwen4_graph_mtp_chain_step(ds4_qwen4_gpu_graph *g, const ds4_model *
     const uint64_t emb_bytes = (uint64_t)E * sizeof(float);
     const uint64_t cat_bytes = (hc + 1u) * 2u * emb_bytes;
     const uint64_t proj_bytes = (hc + 1u) * emb_bytes;
-    qwen4_ref_row(m, w->token_embd, (uint64_t)next_token, g->host_row);
+    ds4_ref_row(m, w->token_embd, (uint64_t)next_token, g->host_row);
     if (!ds4_gpu_tensor_write(g->mtp_e, 0, g->host_row, emb_bytes) ||
         !glm_graph_begin_commands_if_needed()) return false;
     ds4_gpu_tensor *R_save = g->R;
@@ -66991,7 +66998,7 @@ int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt) {
  * gammas except ssm_norm are folded to 1+w, ssm_a holds -exp(A_log).
  * --------------------------------------------------------------------- */
 
-static void qwen4_ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row, float *out) {
+static void ds4_ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row, float *out) {
     const uint64_t n = t->dim[0];
     switch (t->type) {
     case DS4_TENSOR_F32:
@@ -67135,13 +67142,13 @@ static void qwen4_ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row,
     }
 }
 
-static void qwen4_ref_matvec_rows(
+static void ds4_ref_matvec_rows(
         const ds4_model *m, const ds4_tensor *w, uint64_t row0, uint64_t n_rows,
         const float *x, float *out) {
     const uint64_t n = w->dim[0];
     float *row = xmalloc(n * sizeof(float));
     for (uint64_t r = 0; r < n_rows; r++) {
-        qwen4_ref_row(m, w, row0 + r, row);
+        ds4_ref_row(m, w, row0 + r, row);
         double acc = 0.0;
         for (uint64_t i = 0; i < n; i++) acc += (double)row[i] * x[i];
         out[r] = (float)acc;
@@ -67149,16 +67156,16 @@ static void qwen4_ref_matvec_rows(
     free(row);
 }
 
-static void qwen4_ref_matvec(const ds4_model *m, const ds4_tensor *w, const float *x, float *out) {
-    qwen4_ref_matvec_rows(m, w, 0, w->ndim >= 2 ? w->dim[1] : 1u, x, out);
+static void ds4_ref_matvec(const ds4_model *m, const ds4_tensor *w, const float *x, float *out) {
+    ds4_ref_matvec_rows(m, w, 0, w->ndim >= 2 ? w->dim[1] : 1u, x, out);
 }
 
-static const float *qwen4_ref_f32(const ds4_model *m, const ds4_tensor *t) {
+static const float *ds4_ref_f32(const ds4_model *m, const ds4_tensor *t) {
     if (t->type != DS4_TENSOR_F32) ds4_die("qwen4 reference: expected an F32 tensor");
     return (const float *)tensor_data(m, t);
 }
 
-static void qwen4_ref_rms(float *out, const float *x, const float *g, uint32_t n, float eps) {
+static void ds4_ref_rms(float *out, const float *x, const float *g, uint32_t n, float eps) {
     double ss = 0.0;
     for (uint32_t i = 0; i < n; i++) ss += (double)x[i] * x[i];
     const float scale = 1.0f / sqrtf((float)(ss / n) + eps);
@@ -67167,29 +67174,29 @@ static void qwen4_ref_rms(float *out, const float *x, const float *g, uint32_t n
 
 static void qwen4_ref_grouped_rms(float *out, const float *x, const float *g, uint32_t groups, uint32_t n, float eps) {
     for (uint32_t s = 0; s < groups; s++) {
-        qwen4_ref_rms(out + (uint64_t)s * n, x + (uint64_t)s * n, g ? g + (uint64_t)s * n : NULL, n, eps);
+        ds4_ref_rms(out + (uint64_t)s * n, x + (uint64_t)s * n, g ? g + (uint64_t)s * n : NULL, n, eps);
     }
 }
 
-static void qwen4_ref_l2norm(float *x, uint32_t n) {
+static void ds4_ref_l2norm(float *x, uint32_t n) {
     double ss = 0.0;
     for (uint32_t i = 0; i < n; i++) ss += (double)x[i] * x[i];
     const float scale = 1.0f / sqrtf((float)ss + 1e-6f);
     for (uint32_t i = 0; i < n; i++) x[i] *= scale;
 }
 
-static void qwen4_ref_rope(float *x, uint32_t n_rot, const uint32_t *p3) {
+static void ds4_ref_rope(float *x, uint32_t n_rot, const uint32_t *p3) {
     const uint32_t half = n_rot / 2u;
     for (uint32_t i = 0; i < half; i++) {
-        const double theta = (double)p3[i % 3u] * (double)g_qwen4_rope_freq[i];
-        const float c = (float)cos(theta) * g_qwen4_rope_mscale, s = (float)sin(theta) * g_qwen4_rope_mscale;
+        const double theta = (double)p3[i % 3u] * (double)g_ds4_rope_freq[i];
+        const float c = (float)cos(theta) * g_ds4_rope_mscale, s = (float)sin(theta) * g_ds4_rope_mscale;
         const float x0 = x[i], x1 = x[i + half];
         x[i] = x0 * c - x1 * s;
         x[i + half] = x0 * s + x1 * c;
     }
 }
 
-static float qwen4_ref_softplus(float x) {
+static float ds4_ref_softplus(float x) {
     return x > 20.0f ? x : log1pf(expf(x));
 }
 
@@ -67244,10 +67251,10 @@ static void qwen4_ref_hc_mix(
     float *xn = xmalloc(hc_dim * sizeof(float));
     float *lo = xmalloc(rank * sizeof(float));
     float *gate = xmalloc(hc_dim * sizeof(float));
-    qwen4_ref_grouped_rms(xn, R, qwen4_ref_f32(m, norm), hc, E, DS4_RMS_EPS);
-    qwen4_ref_matvec(m, down, xn, lo);
+    qwen4_ref_grouped_rms(xn, R, ds4_ref_f32(m, norm), hc, E, DS4_RMS_EPS);
+    ds4_ref_matvec(m, down, xn, lo);
     for (uint32_t r = 0; r < rank; r++) lo[r] = silu(lo[r] / (float)hc);
-    qwen4_ref_matvec(m, up, lo, gate);
+    ds4_ref_matvec(m, up, lo, gate);
     for (uint32_t d = 0; d < E; d++) {
         double acc = 0.0;
         for (uint32_t s = 0; s < hc; s++) {
@@ -67257,7 +67264,7 @@ static void qwen4_ref_hc_mix(
         mixed[d] = (float)(acc / hc);
     }
     if (inject && inj) {
-        qwen4_ref_matvec(m, inject, xn, inj);
+        ds4_ref_matvec(m, inject, xn, inj);
         for (uint32_t s = 0; s < hc; s++) inj[s] = 2.0f * sigmoid_stable(inj[s] / (float)hc);
     }
     free(gate);
@@ -67314,10 +67321,10 @@ static void qwen4_ref_ple(const ds4_model *m, const ds4_layer_weights *l,
     float *value = xmalloc(E * sizeof(float));
     float *gated = xmalloc(hc_dim * sizeof(float));
     float *normed = xmalloc(hc_dim * sizeof(float));
-    qwen4_ref_matvec(m, l->ple_key, emb, key);
-    qwen4_ref_grouped_rms(keyn, key, qwen4_ref_f32(m, l->ple_norm_key), hc, E, DS4_RMS_EPS);
-    qwen4_ref_grouped_rms(query, R, qwen4_ref_f32(m, l->ple_norm_query), hc, E, DS4_RMS_EPS);
-    qwen4_ref_matvec(m, l->ple_value, emb, value);
+    ds4_ref_matvec(m, l->ple_key, emb, key);
+    qwen4_ref_grouped_rms(keyn, key, ds4_ref_f32(m, l->ple_norm_key), hc, E, DS4_RMS_EPS);
+    qwen4_ref_grouped_rms(query, R, ds4_ref_f32(m, l->ple_norm_query), hc, E, DS4_RMS_EPS);
+    ds4_ref_matvec(m, l->ple_value, emb, value);
     for (uint32_t s = 0; s < hc; s++) {
         double dot = 0.0;
         for (uint32_t d = 0; d < E; d++) dot += (double)keyn[s * E + d] * query[s * E + d];
@@ -67326,17 +67333,17 @@ static void qwen4_ref_ple(const ds4_model *m, const ds4_layer_weights *l,
         g = sigmoid_stable(g > 0.0f ? mag : (g < 0.0f ? -mag : 0.0f));
         for (uint32_t d = 0; d < E; d++) gated[s * E + d] = g * value[d];
     }
-    qwen4_ref_grouped_rms(normed, gated, qwen4_ref_f32(m, l->ple_norm_conv), hc, E, DS4_RMS_EPS);
+    qwen4_ref_grouped_rms(normed, gated, ds4_ref_f32(m, l->ple_norm_conv), hc, E, DS4_RMS_EPS);
 
     /* depthwise conv, kernel K dilated by the n-gram size: tap k reads (K-1-k)*dil back */
     float *cw_f16 = NULL;
     const float *cw;
     if (l->ple_conv->type == DS4_TENSOR_F16) {
         cw_f16 = xmalloc((size_t)hc_dim * DS4_N_PLE_CONV * sizeof(float));
-        for (uint32_t c = 0; c < hc_dim; c++) qwen4_ref_row(m, l->ple_conv, c, cw_f16 + (uint64_t)c * DS4_N_PLE_CONV);
+        for (uint32_t c = 0; c < hc_dim; c++) ds4_ref_row(m, l->ple_conv, c, cw_f16 + (uint64_t)c * DS4_N_PLE_CONV);
         cw = cw_f16;
     } else {
-        cw = qwen4_ref_f32(m, l->ple_conv);
+        cw = ds4_ref_f32(m, l->ple_conv);
     }
     for (uint32_t c = 0; c < hc_dim; c++) {
         double acc = 0.0;
@@ -67364,13 +67371,13 @@ static void qwen4_ref_linear(const ds4_model *m, const ds4_layer_weights *l, uin
     float *b = xmalloc(Hv * sizeof(float));
     float *a = xmalloc(Hv * sizeof(float));
     float *o = xmalloc(v_dim * sizeof(float));
-    qwen4_ref_matvec(m, l->lin_qkv, x, qkv);
-    qwen4_ref_matvec(m, l->lin_gate, x, z);
-    qwen4_ref_matvec(m, l->lin_beta, x, b);
-    qwen4_ref_matvec(m, l->lin_alpha, x, a);
+    ds4_ref_matvec(m, l->lin_qkv, x, qkv);
+    ds4_ref_matvec(m, l->lin_gate, x, z);
+    ds4_ref_matvec(m, l->lin_beta, x, b);
+    ds4_ref_matvec(m, l->lin_alpha, x, a);
 
     float *hist = st->lin_hist + (uint64_t)il * (K - 1u) * conv_dim;
-    const float *cw = qwen4_ref_f32(m, l->lin_conv);
+    const float *cw = ds4_ref_f32(m, l->lin_conv);
     for (uint32_t c = 0; c < conv_dim; c++) {
         double acc = (double)cw[(uint64_t)c * K + (K - 1u)] * qkv[c];
         for (uint32_t k = 0; k + 1u < K; k++) acc += (double)cw[(uint64_t)c * K + k] * hist[(uint64_t)k * conv_dim + c];
@@ -67382,16 +67389,16 @@ static void qwen4_ref_linear(const ds4_model *m, const ds4_layer_weights *l, uin
     float *q = conv, *k = conv + k_dim, *v = conv + 2u * k_dim;
     const float qscale = 1.0f / sqrtf((float)D);
     for (uint32_t h = 0; h < Hk; h++) {
-        qwen4_ref_l2norm(q + h * D, D);
-        qwen4_ref_l2norm(k + h * D, D);
+        ds4_ref_l2norm(q + h * D, D);
+        ds4_ref_l2norm(k + h * D, D);
         for (uint32_t i = 0; i < D; i++) q[h * D + i] *= qscale;
     }
-    const float *A = qwen4_ref_f32(m, l->lin_a);
-    const float *dt = qwen4_ref_f32(m, l->lin_dt_bias);
-    const float *nw = qwen4_ref_f32(m, l->lin_norm);
+    const float *A = ds4_ref_f32(m, l->lin_a);
+    const float *dt = ds4_ref_f32(m, l->lin_dt_bias);
+    const float *nw = ds4_ref_f32(m, l->lin_norm);
     for (uint32_t j = 0; j < Hv; j++) {
         const uint32_t kh = j % Hk;
-        const float g = expf(A[j] * qwen4_ref_softplus(a[j] + dt[j]));
+        const float g = expf(A[j] * ds4_ref_softplus(a[j] + dt[j]));
         const float beta = sigmoid_stable(b[j]);
         float *S = st->lin_state + ((uint64_t)il * Hv + j) * D * D;   /* [dk][dv] */
         const float *qj = q + kh * D, *kj = k + kh * D, *vj = v + j * D;
@@ -67412,10 +67419,10 @@ static void qwen4_ref_linear(const ds4_model *m, const ds4_layer_weights *l, uin
         }
         float tmp[DS4_MAX_KDA_HEAD_DIM];
         if (D > DS4_MAX_KDA_HEAD_DIM) ds4_die("Qwen3.8 reference: linear head dim exceeds 128");
-        qwen4_ref_rms(tmp, oj, nw, D, DS4_RMS_EPS);
+        ds4_ref_rms(tmp, oj, nw, D, DS4_RMS_EPS);
         for (uint32_t dv = 0; dv < D; dv++) oj[dv] = tmp[dv] * sigmoid_stable(z[j * D + dv]);
     }
-    qwen4_ref_matvec(m, l->lin_out, o, out);
+    ds4_ref_matvec(m, l->lin_out, o, out);
     free(o); free(a); free(b); free(z); free(conv); free(qkv);
 }
 
@@ -67427,8 +67434,8 @@ static uint32_t qwen4_ref_select(const ds4_model *m, const ds4_layer_weights *l,
     const uint32_t k_blocks = DS4_N_INDEXER_TOP_K / ratio;
     float *qi = xmalloc((uint64_t)Hi * Di * sizeof(float));
     float *kraw = st->idx_k + ((uint64_t)il * st->cap + pos) * Di;
-    qwen4_ref_matvec(m, l->indexer_q_proj, x, qi);
-    qwen4_ref_matvec(m, l->indexer_k_proj, x, kraw);
+    ds4_ref_matvec(m, l->indexer_q_proj, x, qi);
+    ds4_ref_matvec(m, l->indexer_k_proj, x, kraw);
 
     const uint32_t n_vis = pos + 1u;
     const uint32_t n_blocks = n_vis / ratio;
@@ -67438,12 +67445,12 @@ static uint32_t qwen4_ref_select(const ds4_model *m, const ds4_layer_weights *l,
         free(qi);
         return n_sel;
     }
-    const float *gq = qwen4_ref_f32(m, l->indexer_q_norm);
-    const float *gk = qwen4_ref_f32(m, l->indexer_k_norm);
+    const float *gq = ds4_ref_f32(m, l->indexer_q_norm);
+    const float *gk = ds4_ref_f32(m, l->indexer_k_norm);
     for (uint32_t h = 0; h < Hi; h++) {
         float tmp[DS4_MAX_INDEXER_HEAD_DIM];
-        qwen4_ref_rms(tmp, qi + h * Di, gq, Di, DS4_RMS_EPS);
-        qwen4_ref_rope(tmp, DS4_N_ROT, st->pos3 + (uint64_t)pos * 3u);
+        ds4_ref_rms(tmp, qi + h * Di, gq, Di, DS4_RMS_EPS);
+        ds4_ref_rope(tmp, DS4_N_ROT, st->pos3 + (uint64_t)pos * 3u);
         memcpy(qi + h * Di, tmp, Di * sizeof(float));
     }
     float *score = xmalloc(n_blocks * sizeof(float));
@@ -67456,8 +67463,8 @@ static uint32_t qwen4_ref_select(const ds4_model *m, const ds4_layer_weights *l,
                 acc += st->idx_k[((uint64_t)il * st->cap + b * ratio + t) * Di + d];
             pooled[d] = (float)(acc / ratio);
         }
-        qwen4_ref_rms(key, pooled, gk, Di, DS4_RMS_EPS);
-        qwen4_ref_rope(key, DS4_N_ROT, st->pos3 + (uint64_t)b * ratio * 3u);
+        ds4_ref_rms(key, pooled, gk, Di, DS4_RMS_EPS);
+        ds4_ref_rope(key, DS4_N_ROT, st->pos3 + (uint64_t)b * ratio * 3u);
         double sum = 0.0;
         for (uint32_t h = 0; h < Hi; h++) {
             double dot = 0.0;
@@ -67495,20 +67502,20 @@ static void qwen4_ref_attention(const ds4_model *m, const ds4_layer_weights *l, 
     float *o = xmalloc(q_dim * sizeof(float));
     float *kc = st->attn_k + ((uint64_t)il * st->cap + pos) * kv_dim;
     float *vc = st->attn_v + ((uint64_t)il * st->cap + pos) * kv_dim;
-    qwen4_ref_matvec(m, l->attn_q, x, qg);
-    qwen4_ref_matvec(m, l->attn_k, x, kc);
-    qwen4_ref_matvec(m, l->attn_v, x, vc);
-    const float *gqn = qwen4_ref_f32(m, l->attn_q_norm);
-    const float *gkn = qwen4_ref_f32(m, l->attn_k_norm);
+    ds4_ref_matvec(m, l->attn_q, x, qg);
+    ds4_ref_matvec(m, l->attn_k, x, kc);
+    ds4_ref_matvec(m, l->attn_v, x, vc);
+    const float *gqn = ds4_ref_f32(m, l->attn_q_norm);
+    const float *gkn = ds4_ref_f32(m, l->attn_k_norm);
     for (uint32_t h = 0; h < H; h++) {
-        qwen4_ref_rms(q + h * D, qg + (uint64_t)h * 2u * D, gqn, D, DS4_RMS_EPS);
-        qwen4_ref_rope(q + h * D, DS4_N_ROT, st->pos3 + (uint64_t)pos * 3u);
+        ds4_ref_rms(q + h * D, qg + (uint64_t)h * 2u * D, gqn, D, DS4_RMS_EPS);
+        ds4_ref_rope(q + h * D, DS4_N_ROT, st->pos3 + (uint64_t)pos * 3u);
         memcpy(gate + h * D, qg + (uint64_t)h * 2u * D + D, D * sizeof(float));
     }
     for (uint32_t h = 0; h < Hkv; h++) {
         float tmp[DS4_MAX_HEAD_DIM];
-        qwen4_ref_rms(tmp, kc + h * D, gkn, D, DS4_RMS_EPS);
-        qwen4_ref_rope(tmp, DS4_N_ROT, st->pos3 + (uint64_t)pos * 3u);
+        ds4_ref_rms(tmp, kc + h * D, gkn, D, DS4_RMS_EPS);
+        ds4_ref_rope(tmp, DS4_N_ROT, st->pos3 + (uint64_t)pos * 3u);
         memcpy(kc + h * D, tmp, D * sizeof(float));
     }
 
@@ -67537,7 +67544,7 @@ static void qwen4_ref_attention(const ds4_model *m, const ds4_layer_weights *l, 
             o[h * D + d] = (float)(acc / sum) * sigmoid_stable(gate[h * D + d]);
         }
     }
-    qwen4_ref_matvec(m, l->attn_output, o, out);
+    ds4_ref_matvec(m, l->attn_output, o, out);
     free(p); free(sel); free(o); free(gate); free(q); free(qg);
 }
 
@@ -67549,7 +67556,7 @@ static void qwen4_ref_moe(const ds4_model *m, const ds4_layer_weights *l, const 
     float *g = xcalloc(down_width, sizeof(float));
     float *u = xmalloc(F * sizeof(float));
     float *y = xmalloc(E * sizeof(float));
-    qwen4_ref_matvec(m, l->ffn_gate_inp, x, logits);
+    ds4_ref_matvec(m, l->ffn_gate_inp, x, logits);
     double mx = -DBL_MAX, sum = 0.0;
     for (uint32_t e = 0; e < NE; e++) if (logits[e] > mx) mx = logits[e];
     for (uint32_t e = 0; e < NE; e++) { prob[e] = exp((double)logits[e] - mx); sum += prob[e]; }
@@ -67571,18 +67578,18 @@ static void qwen4_ref_moe(const ds4_model *m, const ds4_layer_weights *l, const 
     for (uint32_t i = 0; i < K; i++) {
         const uint32_t e = (uint32_t)sel[i];
         const float wgt = (float)(prob[e] / wsum);
-        qwen4_ref_matvec_rows(m, l->ffn_gate_exps, (uint64_t)e * F, F, x, g);
-        qwen4_ref_matvec_rows(m, l->ffn_up_exps, (uint64_t)e * F, F, x, u);
+        ds4_ref_matvec_rows(m, l->ffn_gate_exps, (uint64_t)e * F, F, x, g);
+        ds4_ref_matvec_rows(m, l->ffn_up_exps, (uint64_t)e * F, F, x, u);
         for (uint32_t f = 0; f < F; f++) g[f] = silu(g[f]) * u[f];
-        qwen4_ref_matvec_rows(m, l->ffn_down_exps, (uint64_t)e * E, E, g, y);
+        ds4_ref_matvec_rows(m, l->ffn_down_exps, (uint64_t)e * E, E, g, y);
         for (uint32_t d = 0; d < E; d++) out[d] += wgt * y[d];
     }
-    qwen4_ref_matvec(m, l->ffn_gate_shexp, x, g);
-    qwen4_ref_matvec(m, l->ffn_up_shexp, x, u);
+    ds4_ref_matvec(m, l->ffn_gate_shexp, x, g);
+    ds4_ref_matvec(m, l->ffn_up_shexp, x, u);
     for (uint32_t f = 0; f < F; f++) g[f] = silu(g[f]) * u[f];
-    qwen4_ref_matvec(m, l->ffn_down_shexp, g, y);
+    ds4_ref_matvec(m, l->ffn_down_shexp, g, y);
     float sg;
-    qwen4_ref_matvec(m, l->ffn_gate_inp_shexp, x, &sg);
+    ds4_ref_matvec(m, l->ffn_gate_inp_shexp, x, &sg);
     sg = sigmoid_stable(sg);
     for (uint32_t d = 0; d < E; d++) out[d] += sg * y[d];
     free(y); free(u); free(g); free(prob); free(logits);
@@ -67605,7 +67612,7 @@ static void qwen4_ref_layer(const ds4_model *m, const ds4_weights *w, uint32_t i
 }
 
 static void qwen4_ref_output(const ds4_model *m, const ds4_weights *w, const float *mixed, float *logits) {
-    qwen4_ref_matvec(m, w->output, mixed, logits);
+    ds4_ref_matvec(m, w->output, mixed, logits);
 }
 
 /* Forward `token` at `pos`; R_out (optional) receives the pre-mixer stream,
@@ -67620,7 +67627,7 @@ static void qwen4_ref_forward_token(const ds4_model *m, const ds4_weights *w, qw
     const ds4_vision_span *fake = qwen4_fake_spans(&n_fake);
     const float *img = n_fake ? qwen4_span_row(fake, n_fake, pos) : NULL;
     if (img) memcpy(R, img, E * sizeof(float));
-    else qwen4_ref_row(m, w->token_embd, (uint64_t)token, R);
+    else ds4_ref_row(m, w->token_embd, (uint64_t)token, R);
     for (uint32_t s = 1; s < hc; s++) memcpy(R + (uint64_t)s * E, R, E * sizeof(float));
     qwen4_mrope_pos(fake, n_fake, pos, &st->mrope_delta, st->pos3 + (uint64_t)pos * 3u);
     for (uint32_t il = 0; il < n_trunk; il++) {
@@ -67652,17 +67659,17 @@ static void qwen4_ref_mtp(const ds4_model *m, const ds4_weights *w, qwen4_ref_st
     float *ep = xmalloc(E * sizeof(float));
     float mixed[DS4_MAX_EMBD], blk[DS4_MAX_EMBD], inj[DS4_MAX_HC];
 
-    qwen4_ref_row(m, w->token_embd, (uint64_t)next_token, e);
-    qwen4_ref_rms(en, e, qwen4_ref_f32(m, l->nextn_enorm), E, DS4_RMS_EPS);
-    qwen4_ref_rms(hn, R_pre, qwen4_ref_f32(m, l->nextn_hnorm), hc_dim, DS4_RMS_EPS);
+    ds4_ref_row(m, w->token_embd, (uint64_t)next_token, e);
+    ds4_ref_rms(en, e, ds4_ref_f32(m, l->nextn_enorm), E, DS4_RMS_EPS);
+    ds4_ref_rms(hn, R_pre, ds4_ref_f32(m, l->nextn_hnorm), hc_dim, DS4_RMS_EPS);
     /* eh_proj = [W_e | W_h] over concat(e, h): e once, h per stream */
     memcpy(cat, en, E * sizeof(float));
     memset(cat + E, 0, E * sizeof(float));
-    qwen4_ref_matvec(m, l->nextn_eh_proj, cat, ep);
+    ds4_ref_matvec(m, l->nextn_eh_proj, cat, ep);
     memset(cat, 0, E * sizeof(float));
     for (uint32_t s = 0; s < hc; s++) {
         memcpy(cat + E, hn + (uint64_t)s * E, E * sizeof(float));
-        qwen4_ref_matvec(m, l->nextn_eh_proj, cat, R + (uint64_t)s * E);
+        ds4_ref_matvec(m, l->nextn_eh_proj, cat, R + (uint64_t)s * E);
         for (uint32_t d = 0; d < E; d++) R[(uint64_t)s * E + d] += ep[d];
     }
 
@@ -78316,7 +78323,7 @@ static bool qwen4_batch_stage_embeddings(ds4_decode_item *items, int count,
     for (int i = 0; i < count; i++) {
         ds4_qwen4_gpu_graph *rg = &items[i].session->qwen4_graph;
         float *dst = row + (uint64_t)i * hc_dim;
-        qwen4_ref_row(m, w->token_embd, (uint64_t)items[i].token, dst);
+        ds4_ref_row(m, w->token_embd, (uint64_t)items[i].token, dst);
         for (uint32_t s = 1; s < hc; s++) memcpy(dst + (uint64_t)s * E, dst, E * sizeof(float));
         uint32_t pos3[4];
         qwen4_mrope_pos(NULL, 0, rg->pos, &rg->mrope_delta, pos3);
@@ -78713,7 +78720,7 @@ static bool qwen4_batch_stage_embeddings_ragged(const qwen4_batch_member *mem, i
         for (uint32_t t = 0; t < mem[i].n; t++) {
             const uint32_t r = mem[i].row0 + t;
             float *dst = row + (uint64_t)r * hc_dim;
-            qwen4_ref_row(m, w->token_embd, (uint64_t)mem[i].tokens[t], dst);
+            ds4_ref_row(m, w->token_embd, (uint64_t)mem[i].tokens[t], dst);
             for (uint32_t sidx = 1; sidx < hc; sidx++) memcpy(dst + (uint64_t)sidx * E, dst, E * sizeof(float));
             uint32_t pos3[4];
             qwen4_mrope_pos(NULL, 0, rg->pos + t, &rg->mrope_delta, pos3);
@@ -78878,7 +78885,7 @@ static bool qwen4_batch_mtp_drafts(qwen4_batch_member *mem, int count, const uin
         }
     }
     for (uint32_t t = 0; t < N; t++)
-        qwen4_ref_row(m, w->token_embd, (uint64_t)ids[t], g->host_row + (uint64_t)t * E);
+        ds4_ref_row(m, w->token_embd, (uint64_t)ids[t], g->host_row + (uint64_t)t * E);
     if (!ds4_gpu_tensor_write(g->batch_head_x, 0, g->host_row, (uint64_t)N * E * sizeof(float)) ||
         !glm_graph_begin_commands_if_needed()) return false;
     /* The trunk's MoE scratch is idle here. Reuse it for predictor inputs
