@@ -88,3 +88,4 @@ __pycache__/
 /tests/test_q8_prefill_variants
 /tests/test_pq2_0
 /tests/test_qwen35_cuda
+/tests/test_qwen35_session

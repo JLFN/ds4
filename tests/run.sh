@@ -41,6 +41,11 @@ if [[ -f "$MODEL" ]]; then
   step "Bonsai reference checks (model: $MODEL)"
   run "bonsai-fold-selftest" make bonsai-fold-selftest
   run "bonsai-ref-check" make bonsai-ref-check
+  if [[ ${DS4_SKIP_CUDA:-0} != 1 ]]; then
+    step "Bonsai session path against the CPU reference (CUDA)"
+    run "test-qwen35-session" make test-qwen35-session \
+      DS4_TEST_MODEL="$MODEL" CUDA_ARCH="$CUDA_ARCH"
+  fi
 else
   echo
   echo "SKIP model-backed reference checks ($MODEL not present)"

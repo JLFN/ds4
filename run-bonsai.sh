@@ -6,6 +6,7 @@
 #         ./run-bonsai.sh -n 32 "prompt"  greedy tokens to generate (default 24)
 #         ./run-bonsai.sh --cpu "prompt"  run the CPU reference instead of the GPU
 #         ./run-bonsai.sh compare [prompt]  both backends, diffed token for token
+#         ./run-bonsai.sh session [prompt]  the CUDA session path, diffed against the reference
 #         ./run-bonsai.sh bench [tokens]    decode rate (default 16 tokens)
 #         ./run-bonsai.sh status            what is installed and what can run
 #         ./run-bonsai.sh help
@@ -15,13 +16,17 @@
 # (ternary, 2.125 bits per weight) and stored Hadamard-folded, so the engine
 # rotates the activation instead of the weight.
 #
-# WHY THIS IS NOT A SERVER SCRIPT: ds4 has no session or server path for this
-# family yet - the engine refuses --serve/--port with "the session and server
-# paths are not implemented yet" - so the working entry is the diagnostic
-# generator: --first-token-test, which decodes greedily on the CUDA graph
-# (--cuda) or on the built-in CPU reference (--cpu). The CPU reference is the
-# oracle the CUDA kernels are measured against, which is what "compare" proves:
-# the same token ids from both backends.
+# The entry is the diagnostic generator --first-token-test, which decodes
+# greedily on the CUDA graph (--cuda) or on the built-in CPU reference
+# (--cpu).  The CPU reference is the oracle the CUDA kernels are measured
+# against, which is what "compare" proves: the same token ids from both
+# backends.  "session" proves the same thing for the session path: with
+# DS4_QWEN35_SESSION=1 the diagnostic drives the prompt and the greedy steps
+# through a real ds4_session (create, sync, eval) and must print the identical
+# ids.  Launching the binary without --first-token-test now runs the session
+# path for real ("ds4 -m ... --cuda -p 'prompt' -n 24 -t 0" for greedy, the
+# default temperature samples); the server path is a later unit and is not
+# wired into this script yet.
 #
 # Env overrides: DS4_BONSAI_MODEL (model path), DS4_BONSAI_BIN (binary),
 # DS4_BONSAI_BACKEND (cuda|cpu), DS4_BONSAI_STEPS (default tokens).
@@ -128,6 +133,50 @@ bench_mode() {
   generate "$DEFAULT_PROMPT" "$n" "$BACKEND" "$LOG"
 }
 
+# The session path on the CUDA graph, diffed against the CPU reference: the
+# same prompt and the same greedy steps, driven through ds4_session instead of
+# the diagnostic's local graph, so the token ids must match exactly.
+session_mode() {
+  check_env
+  echo "model:   $MODEL"
+  echo "prompt:  $PROMPT"
+  echo "steps:   $STEPS, generated through the session path and the reference"
+  echo
+  echo "--- CUDA session (create, sync, eval) ---"
+  local t0 t1 wall rc
+  t0=$(date +%s.%N)
+  DS4_QWEN35_SESSION=1 DS4_QWEN35_STEPS="$STEPS" "$BIN" -m "$MODEL" --cuda \
+      --first-token-test --raw -p "$PROMPT" > "$LOG" 2>&1
+  rc=$?
+  t1=$(date +%s.%N)
+  wall=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b-a}')
+  if [ "$rc" -ne 0 ]; then
+    echo "session run failed (exit $rc); last lines of $LOG:"
+    tail -5 "$LOG"
+    return 1
+  fi
+  echo "backend:      cuda (session)"
+  echo "wall:         ${wall}s for the prompt plus $STEPS greedy tokens"
+  echo "continuation:"
+  printf '  %s\n' "$(continuation "$LOG")"
+  grep -E '^token ' "$LOG" > /tmp/bonsai-session.tokens
+  echo
+  echo "--- CPU reference (the oracle) ---"
+  generate "$PROMPT" "$STEPS" cpu "$LOG" || return 1
+  grep -E '^token ' "$LOG" > /tmp/bonsai-cpu.tokens
+  echo
+  echo "--- token-for-token diff ---"
+  if diff -q /tmp/bonsai-cpu.tokens /tmp/bonsai-session.tokens >/dev/null; then
+    echo "IDENTICAL: all $STEPS generated token ids agree, so the session path"
+    echo "           reproduces the CPU reference on this prompt"
+    echo "           (per-path token lines kept at /tmp/bonsai-{cpu,session}.tokens)"
+  else
+    echo "DIFFERENT - first differences (cpu vs session):"
+    diff /tmp/bonsai-cpu.tokens /tmp/bonsai-session.tokens | head -20
+    return 1
+  fi
+}
+
 status_mode() {
   echo "binary:  $BIN"
   if [ -x "$BIN" ]; then
@@ -157,19 +206,20 @@ status_mode() {
   if [ -x "$BIN" ] && [ -f "$MODEL" ]; then
     echo "model:   $("$BIN" -m "$MODEL" --inspect 2>/dev/null | grep -E '^arch|logical parameters' | tr '\n' ' ')"
   fi
-  echo "entry:   --first-token-test (greedy generation). No server or session"
-  echo "         path exists for this family yet: ds4-server refuses with"
-  echo "         'the session and server paths are not implemented yet'."
+  echo "entry:   --first-token-test (greedy diagnostic) and the plain CLI"
+  echo "         generation, which now runs the CUDA session path; the server"
+  echo "         path is a later unit and is not wired into this script yet."
 }
 
 usage() {
-  sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # --- argument parsing -------------------------------------------------------
 PROMPT="$DEFAULT_PROMPT"
 case "${1:-}" in
   compare)        shift; [ $# -gt 0 ] && PROMPT="$*"; compare_mode ;;
+  session)        shift; [ $# -gt 0 ] && PROMPT="$*"; session_mode ;;
   bench)          shift; bench_mode "${1:-16}" ;;
   status)         status_mode ;;
   help|-h|--help) usage ;;

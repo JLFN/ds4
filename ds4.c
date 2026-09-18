@@ -60715,6 +60715,9 @@ struct ds4_session {
     ds4_glm_gpu_graph glm_graph;
     bool glm_graph_ready;
 #ifdef DS4_HAS_QWEN4_GPU
+    /* Bonsai (qwen35) holds its graph on the heap: the struct is defined with
+     * the graph itself, further down the file, next to its kernels' wrappers. */
+    struct ds4_qwen35_gpu_graph *qwen35_graph;
     ds4_qwen4_gpu_graph qwen4_graph;
     bool qwen4_graph_ready;
     int qwen4_slot;   /* -1 when the session holds private recurrent state */
@@ -61741,6 +61744,10 @@ static bool ds4_session_is_glm(const ds4_session *s) {
 
 static bool ds4_session_is_qwen4(const ds4_session *s) {
     return s && s->engine && ds4_model_is_qwen4();
+}
+
+static bool ds4_session_is_qwen35(const ds4_session *s) {
+    return s && s->engine && ds4_model_is_qwen35();
 }
 
 #ifndef DS4_NO_GPU
@@ -63356,6 +63363,13 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         return qwen4_session_save_payload(s, fp, err, errlen);
 #endif
     }
+    if (ds4_session_is_qwen35(s)) {
+        /* Its state is the gated delta-net recurrent state, the conv history
+         * and the fp16 k/v caches, not the DeepSeek raw-swa layout the generic
+         * writer below assumes.  Refuse until that serializer exists. */
+        payload_set_err(err, errlen, "Bonsai KV checkpoints are not implemented yet");
+        return 1;
+    }
     if (ds4_session_is_glm(s)) {
 #ifdef DS4_NO_GPU
         payload_set_err(err, errlen, "graph backend support is not compiled in");
@@ -63742,6 +63756,13 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
 #else
         return qwen4_session_load_payload(s, fp, h, &remaining, err, errlen);
 #endif
+    }
+    if (ds4_session_is_qwen35(s)) {
+        /* Its state is the gated delta-net recurrent state, the conv history
+         * and the fp16 k/v caches, not the DeepSeek raw-swa layout the generic
+         * reader below assumes.  Refuse until that serializer exists. */
+        payload_set_err(err, errlen, "Bonsai KV checkpoints are not implemented yet");
+        return 1;
     }
     if (ds4_session_is_glm(s)) {
 #ifdef DS4_NO_GPU
@@ -65067,7 +65088,8 @@ static bool ds4_session_greedy_splitkv_replay_exact(
 
 int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen) {
     if (!s) return -1;
-    if (ds4_session_is_cpu(s) || ds4_session_is_glm(s) || ds4_session_is_ds41(s)) {
+    if (ds4_session_is_cpu(s) || ds4_session_is_glm(s) || ds4_session_is_ds41(s) ||
+        ds4_session_is_qwen35(s)) {
         if (ds4_session_eval(s, token, err, errlen) != 0) return -1;
         return ds4_session_argmax(s);
     }
@@ -65546,7 +65568,8 @@ int ds4_engine_generate_argmax(
                     ds4_backend_name(e->backend));
             return 1;
         }
-        if (e->multi_tier || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        if (e->multi_tier || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 ||
+            ds4_model_is_qwen35()) {
             ds4_session *s = NULL;
             char err[256] = {0};
             const double t_prefill0 = now_sec();
@@ -68577,6 +68600,34 @@ static void ds4_qwen35_ref_forward_token(const ds4_model *m, const ds4_weights *
     free(h);
 }
 
+#ifdef DS4_TEST_HOOKS
+/* Test hook: the Bonsai CPU reference, driven greedily over the same prompt and
+ * step count a session run uses, so a test can diff the session path against
+ * its oracle in one process without any external implementation.  Returns the
+ * number of ids written to `out`, or -1 on bad arguments. */
+int ds4_test_qwen35_ref_greedy(ds4_engine *e, const int *tokens, int n_tokens,
+                               int steps, int *out, int out_cap) {
+    if (!e || !tokens || n_tokens <= 0 || steps < 0 || !out || out_cap < steps) return -1;
+    const ds4_model *m = &e->model;
+    const ds4_weights *w = &e->weights;
+    ds4_qwen35_ref_state st;
+    ds4_qwen35_ref_state_init(&st, (uint32_t)(n_tokens + steps + 1));
+    float *logits = xmalloc((uint64_t)DS4_N_VOCAB * sizeof(float));
+    for (int t = 0; t < n_tokens; t++) {
+        ds4_qwen35_ref_forward_token(m, w, &st, tokens[t], (uint32_t)t, logits);
+    }
+    for (int s = 0; s < steps; s++) {
+        out[s] = sample_argmax(logits, DS4_N_VOCAB);
+        if (s + 1 < steps) {
+            ds4_qwen35_ref_forward_token(m, w, &st, out[s], (uint32_t)(n_tokens + s), logits);
+        }
+    }
+    free(logits);
+    ds4_qwen35_ref_state_free(&st);
+    return steps;
+}
+#endif
+
 /* DS4_QWEN35_FOLD_SELFTEST=1 checks the folded-activation transform inside the
  * engine, with an explicit matrix as the expectation: the block-diagonal
  * Sylvester Hadamard with 1/sqrt(n) normalization must equal
@@ -69033,6 +69084,21 @@ static bool qwen35_graph_open(ds4_qwen35_gpu_graph *g, ds4_engine *e, uint32_t c
     return true;
 }
 
+/* Zero the recurrent state and return to position 0.  The k/v caches need no
+ * clearing: a reset restarts the sequence at position 0, and every cached row
+ * is written before the attention that reads it. */
+static void qwen35_graph_reset(ds4_qwen35_gpu_graph *g) {
+    if (!g || !g->h) return;
+    (void)ds4_gpu_synchronize();
+    const uint64_t state_n = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM * DS4_N_LIN_HEAD_DIM;
+    const uint64_t hist_n = (uint64_t)(DS4_N_LIN_CONV - 1u) * DS4_N_LIN_CONV_DIM;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (g->lin_state[il]) ds4_gpu_tensor_fill_f32(g->lin_state[il], 0.0f, state_n);
+        if (g->lin_hist[il]) ds4_gpu_tensor_fill_f32(g->lin_hist[il], 0.0f, hist_n);
+    }
+    g->pos = 0;
+}
+
 /* T tokens at consecutive positions starting at g->pos.  The token ids are
  * uploaded so the embedding lookup reads the table on the device. */
 static bool qwen35_graph_forward(ds4_qwen35_gpu_graph *g, ds4_engine *e,
@@ -69141,12 +69207,35 @@ static int qwen35_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
 
     /* On CUDA the same test drives the device graph instead of the reference,
      * one token at a time and at the same positions, so the two runs produce
-     * comparable token ids and logits. */
+     * comparable token ids and logits.  DS4_QWEN35_SESSION=1 drives that same
+     * prompt and greedy loop through a real ds4_session (create, sync, eval)
+     * instead of a graph local to this function, so the session path prints the
+     * identical token stream and can be diffed against the reference. */
     const bool on_gpu = e->backend == DS4_BACKEND_CUDA;
+    const bool session_requested = getenv("DS4_QWEN35_SESSION") != NULL;
+    const bool on_session = on_gpu && session_requested;
+    ds4_session *sess = NULL;
     ds4_qwen35_gpu_graph graph;
     ds4_qwen35_ref_state st;
     memset(&graph, 0, sizeof(graph));
-    if (on_gpu) {
+    if (session_requested && !on_gpu) {
+        fprintf(stderr, "ds4: DS4_QWEN35_SESSION needs --cuda; running the CPU reference\n");
+    }
+    if (on_session) {
+        fprintf(stderr, "ds4: Bonsai session path (ds4_session create, sync, eval)\n");
+        ds4_tokens p = { seq, (int)n_seq, 4096 };
+        char serr[192] = "";
+        if (ds4_session_create(&sess, e, (int)(n_seq + steps + 1u)) != 0 ||
+            ds4_session_sync(sess, &p, serr, sizeof(serr)) != 0 ||
+            ds4_session_copy_logits(sess, logits, (int)V) != (int)V) {
+            fprintf(stderr, "ds4: Bonsai session prefill failed: %s\n",
+                    serr[0] ? serr : "session unavailable");
+            ds4_session_free(sess);
+            free(logits);
+            free(seq);
+            return 1;
+        }
+    } else if (on_gpu) {
         if (!qwen35_graph_open(&graph, e, n_seq + steps + 1u)) {
             free(logits);
             free(seq);
@@ -69169,6 +69258,17 @@ static int qwen35_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
     }
 
     const char *dump = getenv("DS4_QWEN35_LOGITS");
+    if (dump && dump[0] && on_session) {
+        /* The session keeps only the newest row's logits, so a per-position
+         * dump is a graph/reference feature.  Refuse rather than write a
+         * silently different file. */
+        fprintf(stderr, "ds4: DS4_QWEN35_LOGITS needs the per-position logits and is "
+                        "not available with DS4_QWEN35_SESSION\n");
+        ds4_session_free(sess);
+        free(logits);
+        free(seq);
+        return 1;
+    }
     if (dump && dump[0]) {
         float *all = xmalloc((uint64_t)n_seq * V * sizeof(float));
         if (on_gpu) {
@@ -69239,7 +69339,18 @@ static int qwen35_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
         fflush(stdout);
         free(txt);
         if (s + 1u < steps) {
-            if (on_gpu) {
+            if (on_session) {
+                char serr[192] = "";
+                if (ds4_session_eval(sess, best, serr, sizeof(serr)) != 0 ||
+                    ds4_session_copy_logits(sess, logits, (int)V) != (int)V) {
+                    fprintf(stderr, "ds4: Bonsai session decode failed at step %u: %s\n",
+                            s, serr[0] ? serr : "logits unavailable");
+                    ds4_session_free(sess);
+                    free(logits);
+                    free(seq);
+                    return 1;
+                }
+            } else if (on_gpu) {
                 if (!qwen35_graph_forward(&graph, e, &best, 1u, logits)) {
                     fprintf(stderr, "ds4: Bonsai CUDA graph failed at decode step %u\n", s);
                     qwen35_graph_free(&graph);
@@ -69253,7 +69364,8 @@ static int qwen35_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
         }
     }
 
-    if (on_gpu) qwen35_graph_free(&graph);
+    if (on_session) ds4_session_free(sess);
+    else if (on_gpu) qwen35_graph_free(&graph);
     else ds4_qwen35_ref_state_free(&st);
     free(logits);
     free(seq);
@@ -72231,17 +72343,22 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
     }
     if (ds4_model_is_qwen35() && !opt->inspect_only) {
-        /* The Bonsai trunk runs either through its CPU reference or through
-         * the CUDA graph (qwen35_graph_forward), which covers the diagnostic
-         * path today.  Everything else is still refused rather than run
-         * through machinery this family does not have. */
+        /* The Bonsai trunk runs through its CPU reference (the diagnostic
+         * oracle) or through the CUDA graph, which serves both the diagnostic
+         * and the session/server path (qwen35_graph_forward).  Everything else
+         * is still refused rather than run through machinery this family does
+         * not have: no tensor parallelism, no pipeline/distributed ranks, no
+         * SSD streaming, no DSpark/MTP drafting, no steering. */
         const bool cpu_reference =
             opt->first_token_test && e->backend == DS4_BACKEND_CPU;
         const bool cuda_graph =
             opt->first_token_test && e->backend == DS4_BACKEND_CUDA &&
             (!gpu_cfg || gpu_cfg->n_gpus <= 1) && !opt->cuda_tensor_parallel;
+        const bool cuda_session =
+            e->backend == DS4_BACKEND_CUDA &&
+            (!gpu_cfg || gpu_cfg->n_gpus <= 1) && !opt->cuda_tensor_parallel;
         const bool supported =
-            (cpu_reference || cuda_graph) &&
+            (cpu_reference || cuda_graph || cuda_session) &&
             opt->tp.role == DS4_TP_NONE &&
             opt->distributed.role == DS4_DISTRIBUTED_NONE && !load_slice &&
             !e->ssd_streaming && !opt->dspark && !opt->glm_mtp &&
@@ -72249,9 +72366,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
             (!opt->directional_steering_file || !opt->directional_steering_file[0]) &&
             e->power_percent == 100;
         if (!supported) {
-            fprintf(stderr, "ds4: Bonsai (qwen35) runs only through --first-token-test, "
-                            "on the CPU reference (--cpu) or the CUDA graph (--cuda); "
-                            "the session and server paths are not implemented yet\n");
+            fprintf(stderr, "ds4: Bonsai (qwen35) runs on the CPU reference (--cpu "
+                            "--first-token-test, the diagnostic oracle) or on single-GPU "
+                            "CUDA (--cuda, diagnostic or session/server); tensor "
+                            "parallelism, SSD streaming, DSpark/MTP and steering are "
+                            "not supported\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -74459,6 +74578,11 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             fprintf(stderr, "ds4: Qwen3.8 sessions require Metal or CUDA\n");
             return 1;
         }
+        if (ds4_model_is_qwen35()) {
+            fprintf(stderr, "ds4: Bonsai sessions require the CUDA graph "
+                            "(the CPU reference is the diagnostic --first-token-test)\n");
+            return 1;
+        }
         if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR) {
             fprintf(stderr, "ds4: distributed coordinator sessions require the graph backend\n");
             return 1;
@@ -74597,6 +74721,34 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->prefill_cap = (uint32_t)ctx_size;
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
         s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
+        if (!ds4_session_tp_register(s)) {
+            ds4_session_free(s);
+            return 1;
+        }
+        *out = s;
+        return 0;
+    }
+#endif
+#ifdef DS4_HAS_QWEN4_GPU
+    if (ds4_model_is_qwen35()) {
+        if (e->backend != DS4_BACKEND_CUDA ||
+            e->distributed.role != DS4_DISTRIBUTED_NONE ||
+            e->cuda_tensor_parallel || e->tp.active) {
+            fprintf(stderr, "ds4: Bonsai sessions require single-GPU CUDA "
+                            "(on the CPU the reference path is the diagnostic "
+                            "--first-token-test only)\n");
+            free(s);
+            return 1;
+        }
+        s->qwen35_graph = xcalloc(1, sizeof(*s->qwen35_graph));
+        if (!s->qwen35_graph || !qwen35_graph_open(s->qwen35_graph, e, (uint32_t)ctx_size)) {
+            free(s->qwen35_graph);
+            free(s);
+            return 1;
+        }
+        s->prefill_cap = (uint32_t)ctx_size;
+        s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+        s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
         if (!ds4_session_tp_register(s)) {
             ds4_session_free(s);
             return 1;
@@ -74948,7 +75100,11 @@ void ds4_session_free(ds4_session *s) {
         } else
 #endif
 #ifdef DS4_HAS_QWEN4_GPU
-        if (ds4_session_is_qwen4(s)) {
+        if (s->qwen35_graph) {
+            /* Bonsai owns its graph on the heap. */
+            qwen35_graph_free(s->qwen35_graph);
+            free(s->qwen35_graph);
+        } else if (ds4_session_is_qwen4(s)) {
             if (s->engine && s->engine->glm_mtp_timing && s->qwen4_spec_cycles) {
                 fprintf(stderr, "ds4: Qwen3.8 mtp: %" PRIu64 " verify cycles, %" PRIu64 " drafts accepted (%.1f%%)\n",
                         s->qwen4_spec_cycles, s->qwen4_spec_accepted,
@@ -75661,6 +75817,20 @@ static int qwen4_session_replay_if_stale(ds4_session *s, char *err, size_t errle
     s->checkpoint_valid = false;
     const int rc = kept.len ? ds4_session_sync(s, &kept, err, errlen) : 0;
     if (!kept.len) qwen4_graph_reset(&s->qwen4_graph);
+    token_vec_free(&kept);
+    return rc;
+}
+
+/* The Bonsai graph cannot roll its recurrent state back, so a session whose
+ * checkpoint is ahead of the graph (a rewind, or a decode that failed after
+ * the graph advanced) re-runs the kept tokens before the next one. */
+static int qwen35_session_replay_if_stale(ds4_session *s, char *err, size_t errlen) {
+    if (!s->qwen35_graph || s->qwen35_graph->pos == (uint32_t)s->checkpoint.len) return 0;
+    token_vec kept = {0};
+    for (int i = 0; i < s->checkpoint.len; i++) token_vec_push(&kept, s->checkpoint.v[i]);
+    s->checkpoint_valid = false;
+    const int rc = kept.len ? ds4_session_sync(s, &kept, err, errlen) : 0;
+    if (!kept.len) qwen35_graph_reset(s->qwen35_graph);
     token_vec_free(&kept);
     return rc;
 }
@@ -76973,6 +77143,58 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         if (prefill_rc != 0) return prefill_rc;
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
+        return 0;
+    }
+#endif
+#ifdef DS4_HAS_QWEN4_GPU
+    if (ds4_session_is_qwen35(s)) {
+        ds4_engine *e = s->engine;
+        ds4_qwen35_gpu_graph *g = s->qwen35_graph;
+        if (!g) {
+            snprintf(err, errlen, "Bonsai graph is not initialized");
+            return 1;
+        }
+        int start = 0;
+        /* A checkpoint the prompt extends continues where it stopped: the graph
+         * state already ends at the checkpoint's last position. */
+        if (s->checkpoint_valid && g->pos == (uint32_t)s->checkpoint.len &&
+            prompt->len >= s->checkpoint.len &&
+            ds4_tokens_starts_with(prompt, &s->checkpoint)) {
+            start = s->checkpoint.len;
+        } else {
+            qwen35_graph_reset(g);
+            s->checkpoint.len = 0;
+            s->checkpoint_valid = false;
+        }
+        for (int i = start; i < prompt->len; i++) {
+            if (prompt->v[i] < 0 || prompt->v[i] >= (int)DS4_N_VOCAB) {
+                snprintf(err, errlen, "token id %d at position %d is outside the vocabulary",
+                         prompt->v[i], i);
+                return 1;
+            }
+        }
+        /* One token per forward: the graph's transient tensors hold a single
+         * row, so a batched prefill needs the wider arena Phase F plans. */
+        for (int i = start; i < prompt->len; i++) {
+            if (g->pos >= g->ctx_cap) {
+                snprintf(err, errlen, "context is full");
+                return 1;
+            }
+            if (ds4_session_cancelled(s)) {
+                s->checkpoint_valid = s->checkpoint.len > 0;
+                snprintf(err, errlen, "interrupted");
+                return DS4_SESSION_SYNC_INTERRUPTED;
+            }
+            if (!qwen35_graph_forward(g, e, prompt->v + i, 1u, s->logits)) {
+                snprintf(err, errlen, "Bonsai prefill failed at token %d", i);
+                s->checkpoint_valid = false;
+                return 1;
+            }
+            token_vec_push(&s->checkpoint, prompt->v[i]);
+            s->checkpoint_valid = true;
+            s->mtp_draft_valid = false;
+            if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
+        }
         return 0;
     }
 #endif
@@ -78994,6 +79216,30 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         token_vec_push(&s->checkpoint, token);
         s->checkpoint_valid = true;
         s->qwen4_rewound = false;
+        s->mtp_draft_valid = false;
+        (void)probe_mtp;
+        return 0;
+    }
+#endif
+#ifdef DS4_HAS_QWEN4_GPU
+    if (ds4_session_is_qwen35(s)) {
+        ds4_qwen35_gpu_graph *g = s->qwen35_graph;
+        if (!g) {
+            if (errlen) snprintf(err, errlen, "Bonsai graph is not initialized");
+            return 1;
+        }
+        if (qwen35_session_replay_if_stale(s, err, errlen) != 0) return 1;
+        if (g->pos >= g->ctx_cap) {
+            if (errlen) snprintf(err, errlen, "context is full");
+            return 1;
+        }
+        if (!qwen35_graph_forward(g, e, &token, 1u, s->logits)) {
+            if (errlen) snprintf(err, errlen, "Bonsai decode failed");
+            s->checkpoint_valid = false;
+            return 1;
+        }
+        token_vec_push(&s->checkpoint, token);
+        s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
         (void)probe_mtp;
         return 0;
@@ -85593,6 +85839,7 @@ static int ds4_sessions_eval_batch_cuda(ds4_decode_item *items, int count,
     if (e->backend == DS4_BACKEND_CUDA &&
         !ds4_session_is_glm(first) && !ds4_session_is_ds41(first) &&
         !ds4_session_is_qwen4(first) &&
+        !ds4_session_is_qwen35(first) &&
         e->support_kind == DS4_SUPPORT_NONE) {
         bool ok = ds4_gpu_begin_commands() != 0;
         for (int i = 0; ok && i < count; i++) {
@@ -85723,6 +85970,7 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
         e->backend == DS4_BACKEND_CUDA &&
         !ds4_session_is_glm(prefill_session) && !ds4_session_is_ds41(prefill_session) &&
         !ds4_session_is_qwen4(prefill_session) &&
+        !ds4_session_is_qwen35(prefill_session) &&
         e->support_kind == DS4_SUPPORT_NONE &&
         metal_graph_mixed_prefill_decode_supported(
                 prefill_session, prefill_prompt, start, prefill_rows,
@@ -86809,6 +87057,7 @@ void ds4_session_invalidate(ds4_session *s) {
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (s->ds41_graph_ready) ds41_graph_reset(&s->ds41_graph);
 #endif
+    if (s->qwen35_graph) qwen35_graph_reset(s->qwen35_graph);
     ds4_session_glm_reset_dense_cache(s);
 #endif
 }
@@ -86854,6 +87103,15 @@ void ds4_session_rewind(ds4_session *s, int pos) {
         /* Qwen eval replays the kept transcript if reset left the graph behind. */
         state_ok = true;
         s->qwen4_rewound = logit_row < 0;
+    }
+#endif
+#ifdef DS4_HAS_QWEN4_GPU
+    if (s->checkpoint_valid && ds4_session_is_qwen35(s)) {
+        /* The graph cannot roll its recurrent state back, so drop it and keep
+         * the checkpoint: the next decode replays the kept tokens (qwen4's
+         * convention, see qwen35_session_replay_if_stale). */
+        if (s->qwen35_graph) qwen35_graph_reset(s->qwen35_graph);
+        state_ok = true;
     }
 #endif
     if (s->checkpoint_valid && ds4_session_is_glm(s)) {

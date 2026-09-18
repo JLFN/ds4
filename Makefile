@@ -481,6 +481,20 @@ tests/test_qwen35_cuda: tests/test_qwen35_cuda.cu ds4_cuda_test_hooks.o ds4_gpu_
 test-qwen35-cuda: tests/test_qwen35_cuda
 	./tests/test_qwen35_cuda
 
+# The Bonsai session path (create/sync/eval, prefix reuse, rewind replay,
+# invalidate rebuild, and the context bound) against the in-process CPU
+# reference, on the real model:
+#   DS4_TEST_MODEL=/data/models/Ternary-Bonsai-2-27B-PQ2_0.gguf make test-qwen35-session
+tests/test_qwen35_session.o: tests/test_qwen35_session.c ds4.h
+	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_qwen35_session: tests/test_qwen35_session.o ds4_cuda_test_hooks.o ds4_gpu_args.o ds4_kvstore.o rax.o $(filter-out ds4.o,$(CORE_OBJS))
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+.PHONY: test-qwen35-session
+test-qwen35-session: tests/test_qwen35_session
+	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_qwen35_session
+
 tests/test_deepseek41_cuda.o: tests/test_deepseek41_metal.c ds4_gpu.h ds4_deepseek41_gpu.h
 	$(CC) $(QUALITY_CFLAGS) -D_GNU_SOURCE -I. -c -o $@ $<
 
