@@ -15794,6 +15794,15 @@ int main(int argc, char **argv) {
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
+        if (ds4_engine_is_qwen35(engine)) {
+            /* This family has no checkpoint serializer yet, and the store also
+             * keys its entries on routed-expert quantization, which a dense
+             * model does not have.  Say so rather than leaving the configured
+             * cache silently unused. */
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: session checkpoints are not implemented for this model; "
+                       "--kv-disk-dir stays unused");
+        }
     }
     if (s.disable_exact_dsml_tool_replay) {
         server_log(DS4_LOG_DEFAULT,
