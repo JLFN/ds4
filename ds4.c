@@ -67561,6 +67561,31 @@ static void ds4_hadamard_matmul_input(float *x, uint32_t n, bool ssm_out, float 
     ds4_hadamard_forward(x, n, ds4_hadamard_signs_for(n));
 }
 
+/* Prism PQ2_0: 128 weights per block, one fp16 scale, 32 code bytes; element
+ * j lives in byte j/4 at bits (j%4)*2 and dequantizes to (code - 1)*d.  This
+ * is the reference every CUDA PQ2_0 kernel is measured against, so the CUDA
+ * parity test drives it directly through ds4_test_pq2_0_ref_row(). */
+static void pq2_0_row_f32(const uint8_t *p, uint64_t n, float *out) {
+    const uint64_t blocks = n / 128u;
+    for (uint64_t b = 0; b < blocks; b++, p += 34u) {
+        uint16_t dh;
+        memcpy(&dh, p, sizeof(dh));
+        const float d = f16_to_f32(dh);
+        for (uint32_t j = 0; j < 128u; j++) {
+            const uint8_t code = (uint8_t)((p[2u + (j >> 2)] >> (2u * (j & 3u))) & 3u);
+            out[b * 128u + j] = (float)((int)code - 1) * d;
+        }
+    }
+}
+
+/* Dot of one dequantized weight row against the activation, accumulated in
+ * double so the result does not depend on the thread count. */
+static float ref_row_dot(const float *row, const float *x, uint64_t n) {
+    double acc = 0.0;
+    for (uint64_t i = 0; i < n; i++) acc += (double)row[i] * x[i];
+    return (float)acc;
+}
+
 static void ds4_ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row, float *out) {
     const uint64_t n = t->dim[0];
     switch (t->type) {
@@ -67654,22 +67679,11 @@ static void ds4_ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row, f
         }
         break;
     }
-    case DS4_TENSOR_PQ2_0: {
+    case DS4_TENSOR_PQ2_0:
         /* Bonsai ternary: one fp16 scale per 128 weights, 2-bit codes, element
          * j in byte j/4 at bits (j%4)*2 (LSB first), level = code - 1. */
-        const uint64_t blocks = n / 128u;
-        const uint8_t *p = (const uint8_t *)tensor_data(m, t) + row * blocks * 34u;
-        for (uint64_t b = 0; b < blocks; b++, p += 34u) {
-            uint16_t dh;
-            memcpy(&dh, p, sizeof(dh));
-            const float d = f16_to_f32(dh);
-            for (uint32_t j = 0; j < 128u; j++) {
-                const uint8_t code = (uint8_t)((p[2u + (j >> 2)] >> (2u * (j & 3u))) & 3u);
-                out[b * 128u + j] = (float)((int)code - 1) * d;
-            }
-        }
+        pq2_0_row_f32((const uint8_t *)tensor_data(m, t) + row * (n / 128u) * 34u, n, out);
         break;
-    }
     case DS4_TENSOR_Q2_K: {
         const uint64_t blocks = n / 256u;
         const block_q2_K *p = (const block_q2_K *)((const uint8_t *)tensor_data(m, t) + row * blocks * 84u);
@@ -67719,9 +67733,7 @@ static void ds4_ref_matvec_worker(void *vctx, uint64_t r0, uint64_t r1) {
     float *row = xmalloc((size_t)c->n * sizeof(float));
     for (uint64_t r = r0; r < r1; r++) {
         ds4_ref_row(c->m, c->w, c->row0 + r, row);
-        double acc = 0.0;
-        for (uint64_t i = 0; i < c->n; i++) acc += (double)row[i] * c->x[i];
-        c->out[r] = (float)acc;
+        c->out[r] = ref_row_dot(row, c->x, c->n);
     }
     free(row);
 }
@@ -71458,6 +71470,34 @@ int ds4_test_session_read_logits(ds4_session *s, float *out,
 
 const int *ds4_test_engine_placement(const ds4_engine *e) {
     return e ? e->placement : NULL;
+}
+
+/* Prism PQ2_0 reference entry points for the CUDA parity test
+ * (tests/test_qwen35_cuda.cu).  Both run exactly the reference code the
+ * loader's CPU path runs - pq2_0_row_f32 and the double-precision row dot -
+ * so the test compares CUDA against this file, not against a transcription. */
+int ds4_test_pq2_0_ref_row(const void *blocks, uint64_t row, uint64_t in_dim,
+                           float *out) {
+    if (!blocks || !out || in_dim == 0 || in_dim % 128u != 0u) return 1;
+    pq2_0_row_f32((const uint8_t *)blocks + row * (in_dim / 128u) * 34u,
+                  in_dim, out);
+    return 0;
+}
+
+int ds4_test_pq2_0_ref_matvec(const void *blocks, uint64_t out_dim,
+                              uint64_t in_dim, const float *x, float *out) {
+    if (!blocks || !x || !out || out_dim == 0 ||
+        in_dim == 0 || in_dim % 128u != 0u) {
+        return 1;
+    }
+    float *row = xmalloc((size_t)in_dim * sizeof(float));
+    for (uint64_t r = 0; r < out_dim; r++) {
+        pq2_0_row_f32((const uint8_t *)blocks + r * (in_dim / 128u) * 34u,
+                      in_dim, row);
+        out[r] = ref_row_dot(row, x, in_dim);
+    }
+    free(row);
+    return 0;
 }
 #endif /* DS4_TEST_HOOKS */
 

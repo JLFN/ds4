@@ -27709,8 +27709,32 @@ extern "C" int ds4_gpu_embed_token_quant_tensor(
         uint32_t          n_vocab,
         uint32_t          token,
         uint32_t          n_embd) {
-    if (!out || !model_map || n_embd == 0 || (n_embd & 31u) != 0u ||
-        token >= n_vocab) {
+    if (!out || !model_map || n_embd == 0 || token >= n_vocab) {
+        return 0;
+    }
+    if (weight_type == 142u) {   /* DS4_TENSOR_PQ2_0 (Prism Bonsai) */
+        if ((n_embd & 127u) != 0u) return 0;
+        const uint64_t row_bytes = ((uint64_t)n_embd / 128u) * 34u;
+        if (weight_offset > model_size ||
+            (uint64_t)n_vocab * row_bytes > model_size - weight_offset ||
+            out->bytes < (uint64_t)n_embd * sizeof(float)) {
+            return 0;
+        }
+        const int logical_tier = cuda_current_tier();
+        const unsigned char *w = (const unsigned char *)cuda_resolve_weight_ptr(
+                model_map, weight_offset, (uint64_t)n_vocab * row_bytes,
+                logical_tier, "bonsai_token_embd");
+        if (!w) return 0;
+        const int rc = ds4_mmq_pq2_0_rows_f32(
+                           (float *)out->ptr, w, NULL,
+                           token, 1u, n_embd, cuda_decode_stream());
+        if (rc != 0) {
+            fprintf(stderr, "ds4: bonsai embed token: PQ2_0 lookup failed (%d)\n", rc);
+            return 0;
+        }
+        return cuda_ok(cudaGetLastError(), "bonsai embed token");
+    }
+    if ((n_embd & 31u) != 0u) {
         return 0;
     }
     if (weight_type != 8u) {   /* DS4_TENSOR_Q8_0 */
@@ -27762,8 +27786,34 @@ extern "C" int ds4_gpu_embed_tokens_quant_tensor(
         uint32_t                n_vocab,
         uint32_t                n_tokens,
         uint32_t                n_embd) {
-    if (!out || !tokens || !model_map || n_tokens == 0 || n_embd == 0 ||
-        (n_embd & 31u) != 0u) {
+    if (!out || !tokens || !model_map || n_tokens == 0 || n_embd == 0) {
+        return 0;
+    }
+    if (weight_type == 142u) {   /* DS4_TENSOR_PQ2_0 (Prism Bonsai) */
+        if ((n_embd & 127u) != 0u) return 0;
+        const uint64_t row_bytes = ((uint64_t)n_embd / 128u) * 34u;
+        if (weight_offset > model_size ||
+            (uint64_t)n_vocab * row_bytes > model_size - weight_offset ||
+            out->bytes < (uint64_t)n_tokens * n_embd * sizeof(float) ||
+            tokens->bytes < (uint64_t)n_tokens * sizeof(int32_t)) {
+            return 0;
+        }
+        const int logical_tier = cuda_current_tier();
+        const unsigned char *w = (const unsigned char *)cuda_resolve_weight_ptr(
+                model_map, weight_offset, (uint64_t)n_vocab * row_bytes,
+                logical_tier, "bonsai_token_embd");
+        if (!w) return 0;
+        const int rc = ds4_mmq_pq2_0_rows_f32(
+                           (float *)out->ptr, w,
+                           (const int32_t *)tokens->ptr,
+                           0u, n_tokens, n_embd, cuda_decode_stream());
+        if (rc != 0) {
+            fprintf(stderr, "ds4: bonsai embed tokens: PQ2_0 lookup failed (%d)\n", rc);
+            return 0;
+        }
+        return cuda_ok(cudaGetLastError(), "bonsai embed tokens");
+    }
+    if ((n_embd & 31u) != 0u) {
         return 0;
     }
     if (weight_type != 8u) {   /* DS4_TENSOR_Q8_0 */
@@ -33121,6 +33171,7 @@ static int cuda_matmul_mmq_dense_quant(
     case 12u: block_elems = 256u; block_bytes = 144u; label = "Q4_K"; break;
     case 16u: block_elems = 256u; block_bytes = 66u; label = "IQ2_XXS"; break;
     case 39u: block_elems = 32u; block_bytes = 17u; label = "MXFP4"; break;
+    case 142u: block_elems = 128u; block_bytes = 34u; label = "PQ2_0"; break;
     default: return 0;
     }
     if (!out || !x || !model_map || in_dim == 0u || out_dim == 0u ||
@@ -33170,6 +33221,11 @@ static int cuda_matmul_mmq_dense_quant(
             (float *)out->ptr, (int)out_dim, (int)n_tok, (int)in_dim,
             cuda_decode_stream());
         break;
+    case 142u:
+        rc = ds4_mmq_pq2_0_dense(weights, (const float *)x->ptr,
+            (float *)out->ptr, (int)out_dim, (int)n_tok, (int)in_dim,
+            cuda_decode_stream());
+        break;
     }
     if (rc != 0) {
         fprintf(stderr, "ds4: CUDA dense %s MMQ failed (%d)\n", label, rc);
@@ -33201,6 +33257,7 @@ extern "C" int ds4_gpu_matmul_quant_tensor(
     case 12u:  /* Q4_K */
     case 16u:  /* IQ2_XXS */
     case 39u:  /* MXFP4 */
+    case 142u: /* PQ2_0 (Prism Bonsai ternary) */
         return cuda_matmul_mmq_dense_quant(
             out, model_map, model_size, weight_offset, weight_type,
             in_dim, out_dim, x, n_tok);
