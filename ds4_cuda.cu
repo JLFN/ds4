@@ -2611,6 +2611,8 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
     }
 
     (void)cudaFreeHost(stage);
+    g_model_host_base = model_map;
+    g_model_registered_size = model_size;
     g_model_device_base = (const char *)dev;
     g_model_device_owned = 1;
     g_model_hmm_direct = 0;
@@ -2620,6 +2622,43 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
             t1 - t0,
             (double)map_size / 1073741824.0);
     return 1;
+}
+
+/* Resident weights are the single largest lever on this backend: a mapped host
+ * image makes every forward read every weight byte across the PCIe link, which
+ * on a 6.7 GiB model costs about 0.43 s per token (measured 2026-09-18: 16.8
+ * GB/s against a gen4 x16 link carrying 31.5 GB/s peak), while the same bytes
+ * resident cost about 14 ms at the card's 504 GB/s.  A model that fits is
+ * therefore copied to the device instead of being read through the mapping.
+ * The budget must cover the image plus the runtime's own working set (graph
+ * tensors, k/v cache, cuBLAS), so the copy is taken only when the image fits
+ * in the free device memory with that reserve and a proportional margin left
+ * over.  Multi-GPU placements keep the mapped path: the per-device selective
+ * cache owns residency there, and SSD streaming has no room for a full image
+ * by definition.  The DS4_CUDA_NO_MODEL_COPY / DS4_CUDA_DIRECT_MODEL /
+ * DS4_CUDA_WEIGHT_CACHE / DS4_CUDA_WEIGHT_PRELOAD diagnostic switches still
+ * force the mapped path. */
+static int cuda_model_residency_fits(uint64_t model_size) {
+    if (model_size == 0) return 0;
+    if (g_n_gpus > 1 || g_ssd_streaming_mode) return 0;
+    if (getenv("DS4_CUDA_NO_MODEL_COPY") != NULL ||
+        getenv("DS4_CUDA_DIRECT_MODEL") != NULL ||
+        getenv("DS4_CUDA_WEIGHT_CACHE") != NULL ||
+        getenv("DS4_CUDA_WEIGHT_PRELOAD") != NULL) {
+        return 0;
+    }
+    size_t free_bytes = 0, total_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    /* 1.5 GiB covers the graph's own tensors and cuBLAS workspace at this
+     * model scale; the 1/16 headroom absorbs allocator granularity and the
+     * context's k/v cache growth. */
+    const uint64_t reserve = 1536ull * 1024ull * 1024ull;
+    if ((uint64_t)free_bytes <= reserve) return 0;
+    const uint64_t available = (uint64_t)free_bytes - reserve;
+    return model_size <= available - available / 16u;
 }
 
 static void cuda_model_range_release_all(void) {
@@ -3884,6 +3923,17 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
 
 extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes) {
     (void)max_tensor_bytes;
+    /* Residency is decided before the host registration below, which claims
+     * the whole map for device access and would otherwise pin every weight
+     * read to the PCIe link (see cuda_model_residency_fits).  Only the primary
+     * model image is kept resident: a second map (the MTP or support model) is
+     * a different image and keeps the mapped path this decision replaced. */
+    if (g_model_device_owned) {
+        if (model_map == g_model_host_base) return 1;
+    } else if (cuda_model_residency_fits(model_size) &&
+               cuda_model_copy_chunked(model_map, model_size, map_offset, map_size)) {
+        return 1;
+    }
     if (!ds4_gpu_register_model_map_no_copy(model_map, model_size)) return 0;
     if (getenv("DS4_CUDA_COPY_MODEL_CHUNKED") != NULL &&
         !cuda_model_copy_chunked(model_map, model_size, map_offset, map_size)) {

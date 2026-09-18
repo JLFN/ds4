@@ -1,368 +1,299 @@
-ds4 QA report - Bonsai (qwen35 / Ternary-Bonsai-2-27B-PQ2_0) server path close (unit E2b)
+ds4 QA report - CUDA resident model weights (unit: cuda_model_residency_fits)
 
 Date: 2026-09-18
 QA model: deepseek-v4.1-flash, acting as the rule 19 AI QA-tester
-Branch under test: feature/qwen35-server
-Base ref diffed against: dev (local integration branch, dev = 648bb3f)
-State tested: the unit is UNCOMMITTED, so the working tree is the artifact.
-  git status --short before the QA run: M ds4_server.c, M run-bonsai.sh
-  git diff dev --stat: ds4_server.c 9 insertions; run-bonsai.sh 69 changed lines
-  (66 insertions, 3 deletions). Nothing else is touched: ds4.c, ds4.h, ds4_kvstore.c
-  and the Makefile are byte-identical to dev, which is why every kernel, tokenizer and
-  session-path regression below MUST be unchanged.
-  git diff dev sha256: c25fcf85ba89b08833ed2409335d8a895cc6c65c10eb1b6f1049233ab88c2be8
-  The QA wrote no source, Makefile or script change. The only file it writes in the
-  repo is this report; the scripts that drive the checks live in /tmp and are named
-  where used so a reviewer can re-run every one of them.
+This is the RE-VERIFICATION after the guard fix. Round 1 tested the original
+  guard "if (g_model_device_owned || ...) return 1;" and reported the risk
+  that it returned success for ANY later map call once the primary model was
+  device-owned, skipping the MTP/support map registration at ds4.c:73433.
+  The guard has since been scoped to the primary image and the binaries were
+  rebuilt (make cuda-generic, clean). Everything below that is marked as
+  re-run was re-executed against the final code; the one item not re-run
+  (the full tests/run.sh) is explicitly annotated with why it still stands.
+Branch under test: feature/resident-weights
+Base ref diffed against: dev (dev and HEAD are both
+  b6cf33eac2cef55d7d07a1b50bcccd5d074ed4e3, so the unit is UNCOMMITTED and the
+  working tree is the artifact).
+State tested: git status --short: " M ds4_cuda.cu" and " M
+  qa-evidence/qa-report.md" (this report) and nothing else. Code diff (git
+  diff -- ds4_cuda.cu, 50 insertions) sha256:
+  7ffcb4def5fca4511297c9432c9ef1d0250dd1165fd5f78b52a836dc001b04a5
+  Round 1 code diff (original guard) sha256:
+  b72ed417c57756da04db63c985f7d88a458ff5826319b97b58e832c74ee67324
+  The QA wrote no source, Makefile or script change and ran no git commit,
+  push or checkout. The only repo file it writes is this report; driver
+  output lives in /tmp logs named where used.
 
-Binaries as tested: ds4-server mtime 2026-09-18 19:55:29, newer than ds4_server.c
-  mtime 19:54:12, and the new notice is present in the binary
-  (strings ds4-server | grep -c "session checkpoints are not implemented for this model"
-  returns 1). No rebuild was needed and none was done.
+Binaries as tested: ds4, ds4-bench and ds4-server all mtime 21:51, newer than
+  ds4_cuda.cu (21:47) and ds4_cuda.o (21:48). make -q ds4, ds4-bench and
+  ds4-server each exit 0. The resident run logs show the new build.
 Model: /data/models/Ternary-Bonsai-2-27B-PQ2_0.gguf (arch qwen35, PQ2_0 ternary).
-GPU: RTX 4070 SUPER 12 GB, shared with other sessions. nvidia-smi
-  --query-compute-apps=pid,used_memory was read before and after every run and
-  returned empty every time; every server started for a check was stopped, after which
-  pgrep -a ds4-server found nothing; no other compute process appeared during the run.
-  Every heavy run was strictly sequential.
+GPU: RTX 4070 SUPER 12 GB, shared. nvidia-smi was read before and after every
+  run. During the middle of this QA the other session's llama-server held
+  9158 MiB (pid 3893835, /data/llama-prisma-ml/.../llama-server, the same
+  Bonsai GGUF); the QA did not touch that process, and the runs in that
+  window either declined residency by design (see CHECK 6) or used the light
+  mapped path. When the tenant exited, free windows (used 273 MiB) were used
+  for the resident checks. No two QA GPU processes ran at once; no ds4 strays
+  remained at any point (pgrep -a ds4 empty after every step).
 
-Tooling note (rule 12 tool-first gate): repo-rag-mcp has no ds4 index registered
-  (list_projects shows 21 projects, none is ds4); callgraph-mcp has no ds4 project
-  (only ds4-on-spark, a different root, and no /data/ds4/.callgraph-index.bin);
-  a fresh graphify-rs-out/graph.json exists (mtime 2026-09-18 19:53). The checks of
-  this unit are live behaviour and literal log strings, so the live runs, direct
-  source reading and grep are the authority; the indexes had nothing to add.
+Tooling note (rule 12 tool-first gate): repo-rag-mcp has no ds4 index and
+  callgraph-mcp has no ds4 project (only ds4-on-spark, a different root);
+  graphify-rs-out/graph.json exists but predates the edit, so it was stale
+  for this unit. The questions here are live run behaviour and literal log
+  strings plus the changed function bodies, so the live runs, direct source
+  reading and grep are the authority.
 
-
-SURFACE 1 - ds4_server.c: --kv-disk-dir for this family logs an explicit notice
-
-What I ran (script /tmp/qa-e2b-c-check.sh, one server instance, one request):
-  cd /data/ds4
-  ./ds4-server -m /data/models/Ternary-Bonsai-2-27B-PQ2_0.gguf --cuda -c 2048 \
-      --port 8899 --kv-disk-dir /tmp/qa-e2b-kv
-  curl -s -m 600 "http://127.0.0.1:8899/v1/chat/completions" \
-      -H 'Content-Type: application/json' \
-      -d '{"model":"prism-bonsai-2-27b","messages":[{"role":"user","content":"What is the capital of Italy?"}],"max_tokens":8,"temperature":0}'
-
-Literal key output (grep -nE "KV disk cache|session checkpoints" on /tmp/qa-e2b-c.log):
-  11:0918 20:09:18 ds4-server: KV disk cache /tmp/qa-e2b-kv (budget=4096 MiB, cross-quant=accept, min=512, cold_max=30000, continued=10000, trim=32, align=2048, hit_half_life=21600s)
-  12:0918 20:09:18 ds4-server: session checkpoints are not implemented for this model; --kv-disk-dir stays unused
-The notice sits on the line immediately after the existing "KV disk cache ..." line,
-exactly the placement the brief asked to confirm.
-The small request still completes: client wall 30.06s, finish_reason "length" at the
-8-token cap, reasoning "The user asks: \"What is the capital of the", content empty,
-usage prompt_tokens 59 / completion_tokens 8 / total_tokens 67. (The 8-token cap is far
-below this model's think length; the same budget effect is measured in SURFACE 3 and 4.)
-Directory state: ls -la /tmp/qa-e2b-kv right after startup and again after the request
-shows the empty directory only (drwx------, 40 bytes); find /tmp/qa-e2b-kv -type f | wc -l
-returns 0. No checkpoint was written, no crash.
-Shutdown: log tail "shutdown requested, draining requests"; pgrep -a ds4-server finds
-nothing; nvidia-smi compute apps empty.
-Surface verdict: PASS.
+SURFACES COVERED: ALL NEW SURFACES of this unit - the changed entry points
+ds4_gpu_set_model_map_range and cuda_model_copy_chunked, and the new static
+helper cuda_model_residency_fits (static, verified through its caller).
 
 
-SURFACE 2 - run-bonsai.sh: the new server mode, end to end
+THE THREE CASES OF THE FINAL GUARD (code reading, ds4_cuda.cu:3925-3943)
 
-What I ran:
-  cd /data/ds4 && DS4_BONSAI_CTX=2048 ./run-bonsai.sh server "What is the capital of Portugal?"
-
-Literal output (exit code 0, 44.6s wall clock end to end):
-  model:   /data/models/Ternary-Bonsai-2-27B-PQ2_0.gguf
-  prompt:  What is the capital of Portugal?
-  ctx:     2048 on port 8899
-
-  server:  up (pid 3846679), listening on http://127.0.0.1:8899
-
-  wall:    43.26s for the request
-  answer:   The capital of Portugal is Lisbon.
-  reasoning: User asks: "What is the capital of Portugal?" Simple factual question. Need answer: Lisbon. Keep concise.
-  tokens:   {'prompt_tokens': 65, 'completion_tokens': 33, 'total_tokens': 98, 'prompt_tokens_details': {'cached_tokens': 0, 'cache_write_tokens': 65}}
-
-  server:  stopped (log at /tmp/bonsai-run.log.server)
-
-Server log key lines (from the check A live capture; the runbook reuses the fixed path
-/tmp/bonsai-run.log.server, and the later F4 attempt in this QA overwrote it with its
-own failed-listen log, so that file on disk now holds the F4 content rather than this):
-  chat ctx=0..65:65 prompt done 28.773s
-  chat ctx=65..98:33 gen=33 decoding chunk=2.28 t/s avg=2.28 t/s 14.477s
-  chat ctx=0..65:65 gen=33 finish=stop 43.250s
-  shutdown requested, draining requests
-After the run: pgrep -a ds4-server exit code 1 (no process); nvidia-smi compute apps
-empty.
-Surface verdict: PASS (listening line, wall time, exact answer, reasoning line, usage,
-clean stop, no stray process, GPU free).
-
-
-SURFACE 3 - concurrency and isolation with --batched-session
-
-3a. Brief check B, exactly as specified (three concurrent requests, max_tokens 40,
-temperature 0). Script /tmp/qa-e2b-b-check.sh.
-
-What I ran:
-  ./ds4-server -m /data/models/Ternary-Bonsai-2-27B-PQ2_0.gguf --cuda -c 4096 \
-      --port 8899 --batched-session 3
-  then three background curls in one command, each:
-  curl -s -m 900 "http://127.0.0.1:8899/v1/chat/completions" -H 'Content-Type: application/json' \
-      -d '{"model":"prism-bonsai-2-27b","messages":[{"role":"user","content":"What is the capital of France?"}],"max_tokens":40,"temperature":0}'
-  (same body for Japan and Portugal)
-
-Literal key output:
-  spawn line: 0918 20:06:15 ds4-server: batched mode enabled resident_sessions=3 prefill_quantum=2048 mixed_prefill_quantum=128 decode_coalesce_us=2000
-  curl exits 0/0/0; aggregate wall 131s; client walls: france 130.72s, japan 129.84s, portugal 128.97s
-  france:   finish_reason 'length'; content 'The capital of France';     reasoning head 'The user asks: "What is the capital of France?" This is a simple factual question. The answer is Paris. I should respond'
-  japan:    finish_reason 'length'; content 'The capital of Japan is Tokyo'; reasoning head 'The user asks: "What is the capital of Japan?" This is a simple factual question. The answer is Tokyo. I should provide '
-  portugal: finish_reason 'length'; content 'The capital of Portugal is'; reasoning head 'The user asks: "What is the capital of Portugal?" This is a simple factual question. The answer is Lisbon. I need to pro'
-  each usage: prompt_tokens 59, completion_tokens 40, total 99
-Server log per-request lines (grep -E "prompt done|finish=" /tmp/qa-e2b-b.log):
-  chat ctx=0..59:59 prompt done 26.461s
-  chat ctx=0..59:59 prompt done 25.848s
-  chat ctx=0..59:59 prompt done 53.017s
-  chat ctx=59..99:40 gen=40 decoding chunk=0.39 t/s avg=0.39 t/s 102.518s   (plus the matching finish=length 128.979s)
-  chat ctx=59..99:40 gen=40 decoding chunk=0.52 t/s avg=0.52 t/s 77.540s    (finish=length 103.388s)
-  chat ctx=59..99:40 gen=40 decoding chunk=0.78 t/s avg=0.78 t/s 51.242s    (finish=length 104.259s)
-Literal brief criterion "each must finish with finish_reason stop": NOT MET at
-max_tokens 40. All three responses report finish_reason "length" and the France and
-Portugal contents stop before the city; only Japan's content happens to include Tokyo.
-Everything else the brief requires of B holds: each response's reasoning names its own
-correct city for its own question, there is no crash, no cross-contamination, all three
-exit cleanly, the server shuts down ("shutdown requested, draining requests"), no
-process is left and the GPU is free.
-Root cause, measured not guessed: the same three prompts at temperature 0 need 41-43
-completion tokens (see 3b: 42, 41, 43, all finish stop). The brief's 40-token budget is
-1-3 tokens short of what the model emits, so the server correctly announces "length".
-This is OpenAI max_tokens semantics; it is not a defect of this unit, which touches no
-request handling (ds4_server.c gains only the notice, ds4.c is untouched).
-
-3b. Same scenario, swapped order, max_tokens 64 (script /tmp/qa-e2b-b2-check.sh).
-  ./ds4-server ... -c 4096 --port 8899 --batched-session 3
-  three background curls fired in the order Portugal, Japan, France (swapped relative to B).
-Literal key output:
-  portugal: finish 'stop'; content 'The capital of Portugal is Lisbon.';   completion 42; wall 130.24s
-  japan:    finish 'stop'; content 'The capital of Japan is Tokyo.';        completion 41; wall 130.24s
-  france:   finish 'stop'; content 'The capital of France is Paris.';       completion 43; wall 131.99s
-  each reasoning head names its own country (quoted in the capture); aggregate wall 132s
-  server log: gen=42 finish=stop 130.248s; gen=41 finish=stop 130.248s; gen=43 finish=stop 131.998s
-  clean shutdown; pgrep empty; GPU empty.
-Verdict: PASS (order swap changes nothing; the answers never mix, and with a budget
-above the model's completion length every property of the brief's B holds).
-
-3c. Brief check F1: --batched-session 4 with only two requests (script
-/tmp/qa-e2b-d2f1-check.sh, second half).
-  ./ds4-server ... -c 4096 --port 8899 --batched-session 4
-  two concurrent curls, Italy and Spain, max_tokens 64.
-Literal key output:
-  0918 20:16:07 ds4-server: batched mode enabled resident_sessions=4 prefill_quantum=2048 mixed_prefill_quantum=128 decode_coalesce_us=2000
-  italy: finish 'stop'; content 'The capital of Italy is Rome.';   completion 43; wall 90.52s
-  spain: finish 'stop'; content 'The capital of Spain is Madrid.'; completion 43; wall 90.07s
-  server log contains exactly two sessions: prompt done 26.109s / 26.106s; gen=43 finish=stop 90.074s / 64.412s
-  clean shutdown; no strays; GPU empty.
-Verdict: PASS (two idle slots cause nothing: both sessions answer correctly, the two
-unused slots are never reported active, and shutdown is clean).
-
-3d. Aggregate behaviour, stated plainly.
-  While three requests were in flight, each session decoded at 0.39, 0.52 and 0.78 t/s
-  (the three quote lines in 3a), against 2.28 t/s for a solo decode on this host (SURFACE 2
-  log line) - every request sees roughly one third to one sixth of the solo rate.
-  Prefill is serialized one session at a time: the three "prompt done" stamps are 26.5s,
-  25.8s and 53.0s, the third including about 27.6s of queue wait (its first chunk line
-  reads "avg=0.04 t/s 27.598s" because the average starts at admission).
-  Aggregate decode throughput in the window is about 1.15 t/s (120 tokens in 104s; B2 at
-  64 tokens: about 1.19 t/s over 106s), roughly half the solo 2.28 t/s, and a 64-token
-  answer that takes 44.85s solo (SURFACE 4 D2) takes about 130s with two others in
-  flight. The serial-eval fallback therefore costs per-request latency (about 3x here)
-  and some aggregate throughput; there is no parallelism gain, which is what "native
-  batching does not cover this family" means in practice for this build.
-Surface verdict: PASS for concurrency and isolation (the properties the Phase H gate
-exists for), with the literal finish_reason wording at max_tokens 40 reported in the
-deviation note below rather than hidden.
-
-
-SURFACE 4 - streaming under the new build
-
-Literal brief check D, max_tokens 16 (script /tmp/qa-e2b-d-check.sh). Three prompts
-were tried, each one streaming request against a fresh server
-(./ds4-server ... --cuda -c 2048 --port 8899):
-  d1 "Reply with exactly: hello", d2 "Say hi", d3 "What is the capital of France?"
-  body: {"model":"prism-bonsai-2-27b","messages":[{"role":"user","content":"..."}],
-         "max_tokens":16,"temperature":0,"stream":true}
-Parsed SSE for all three is the same shape:
-  role deltas: 1; reasoning deltas: 16; content deltas: 0; finish_reason: length; [DONE]: True
-  assembled content: ''   (assembled reasoning for d1 starts 'The user wants me to reply with exactly "hello". This is a simple request')
-  first SSE line: ": prefill";   last SSE line: "data: [DONE]"
-So role, reasoning_content deltas, finish_reason and [DONE] are all present, but the
-literal D criterion "must produce ... content deltas" is NOT met at max_tokens 16:
-the model spends the whole 16-token budget inside its think block, so no content token
-can exist yet.
-Root cause, measured: the think block alone is 33 tokens for this prompt (D2 below),
-so content can only start at token 34; a 16-token budget cannot reach it at
-temperature 0.
-D2 diagnostic (script /tmp/qa-e2b-d2f1-check.sh, first half), same streaming request
-with max_tokens 64:
-  role deltas: 1; reasoning deltas: 33; content deltas: 8; finish_reason: stop; [DONE]: True
-  assembled content: '\n\nThe capital of Portugal is Lisbon.'
-  client wall 44.85s; server log "chat ctx=0..59:59 gen=42 finish=stop 44.848s"
-  first line ": prefill", last line "data: [DONE]"
-Surface verdict: PASS for the streaming machinery (role, reasoning deltas, content
-deltas, finish_reason stop and [DONE] were all produced and the content assembles),
-with the literal 16-token content requirement reported in the deviation note below
-rather than hidden.
-
-
-SURFACE 5 - foreign model id and /v1/models (brief F3)
-
-What I ran (script /tmp/qa-e2b-f3b-check.sh, one server instance):
-  GET  http://127.0.0.1:8899/v1/models
-  POST http://127.0.0.1:8899/v1/chat/completions with
-       {"model":"deepseek-v4-flash","messages":[{"role":"user","content":"Reply with exactly: hello"}],"max_tokens":64,"temperature":0}
-Literal key output:
-  /v1/models: id prism-bonsai-2-27b | name Prism Bonsai 2 27B
-              id prism-bonsai-2-27b-chat | name Prism Bonsai 2 27B
-              id prism-bonsai-2-27b-reasoner | name Prism Bonsai 2 27B
-  foreign id: echoed model 'deepseek-v4-flash'; finish_reason stop; content 'hello';
-              reasoning head 'The user wants me to reply with exactly "hello". This is a simple request. I should output exactly the word "hello" with';
-              usage prompt_tokens 57, completion_tokens 35; client wall 39.82s
-  An earlier probe with the same foreign id at max_tokens 32 answered in the same
-  ChatML form but was cut inside the think block (finish length, content empty) - the
-  same budget effect as SURFACE 4, not an id problem.
-Server stopped cleanly; no strays; GPU empty.
-Surface verdict: PASS (the server still serves a foreign id with this family's ChatML
-rendering, and the three family ids are unchanged).
-
-
-SURFACE 6 - port already in use (brief F4)
-
-What I ran (script /tmp/qa-e2b-f4-check.sh):
-  python3 -m http.server 8899 --bind 127.0.0.1 &     (occupies the port; ss -tln confirms LISTEN 127.0.0.1:8899)
-  DS4_BONSAI_CTX=2048 ./run-bonsai.sh server "What is the capital of Austria?"
-Literal output:
-  runbook exit code: 1
-  server exited before listening (exit status above); last lines:
-  ...
-  0918 20:17:46 ds4-server: failed to listen on 127.0.0.1:8899: Address already in use
-  "ds4-server strays after the failed runbook run": none
-  holder stopped; GPU after: empty
-Surface verdict: PASS (fails fast with a clear message, no request is attempted, no
-process is left behind).
-
-
-SURFACE 7 - the E3 KV checkpoint refusal still guards both payload functions
-
-What I ran:
-  grep -n "Bonsai KV checkpoints are not implemented yet" ds4.c
-Literal output:
-  63389:        payload_set_err(err, errlen, "Bonsai KV checkpoints are not implemented yet");
-  63783:        payload_set_err(err, errlen, "Bonsai KV checkpoints are not implemented yet");
-Surrounding lines, save path (ds4_session_save_payload, ds4.c:63384-63391):
-  if (ds4_session_is_qwen35(s)) {
-      /* Its state is the gated delta-net recurrent state, the conv history
-       * and the fp16 k/v caches, not the DeepSeek raw-swa layout the generic
-       * writer below assumes.  Refuse until that serializer exists. */
-      payload_set_err(err, errlen, "Bonsai KV checkpoints are not implemented yet");
+Final guard, verbatim:
+  if (g_model_device_owned) {
+      if (model_map == g_model_host_base) return 1;
+  } else if (cuda_model_residency_fits(model_size) &&
+             cuda_model_copy_chunked(model_map, model_size, map_offset, map_size)) {
       return 1;
   }
-Surrounding lines, load path (ds4_session_load_payload, ds4.c:63778-63784):
-  if (ds4_session_is_qwen35(s)) {
-      /* Its state is the gated delta-net recurrent state, the conv history
-       * and the fp16 k/v caches, not the DeepSeek raw-swa layout the generic
-       * reader below assumes.  Refuse until that serializer exists. */
-      payload_set_err(err, errlen, "Bonsai KV checkpoints are not implemented yet");
-      return 1;
-  }
-In both functions the qwen35 guard sits ahead of the generic DeepSeek payload
-writer/reader (the qwen35 branch is the third family branch, before the glm branch and
-the generic writer that follows it). ds4.c is entered by zero lines of this unit's diff
-(git diff dev --stat lists only ds4_server.c and run-bonsai.sh).
-Surface verdict: PASS.
+
+Case 1 - nothing resident yet (g_model_device_owned == 0):
+  The else-if runs. If cuda_model_residency_fits returns 0 (model_size == 0,
+  g_n_gpus > 1, g_ssd_streaming_mode, any of the four env switches, free
+  memory below the reserve/fit arithmetic, or cudaMemGetInfo failure), the
+  else-if is false and control falls through to
+  ds4_gpu_register_model_map_no_copy - the pre-unit mapped path.
+  If it returns 1, cuda_model_copy_chunked runs; from a clean state (also
+  g_model_registered == 0) it cudaMallocs, chunk-copies, sets
+  g_model_host_base / g_model_registered_size / g_model_device_base and
+  g_model_device_owned = 1, and the caller returns 1 (resident). On an
+  allocation or copy error the helper frees its own buffer and returns 0, and
+  the caller falls through to the mapped registration - graceful, no abort.
+  Sub-case 1b (owned == 0 but g_model_registered == 1, i.e. a previous map
+  was host-registered): cuda_model_copy_chunked hits its own
+  "if (g_model_device_owned || g_model_registered) return 1;" (line 2545)
+  and returns 1 WITHOUT copying and without setting g_model_host_base, so the
+  caller reports the new map as mapped although it is neither resident nor
+  registered. Pre-unit this call reached register_no_copy and registered it.
+  Not reachable on CUDA today (needs a third map call; see residual risks).
+
+Case 2 - the same map again (owned == 1 and model_map == g_model_host_base):
+  returns 1 idempotently; no second copy, no re-registration. The check is
+  pointer-only, so a same-pointer/different-size call would also be treated
+  as already done; no current caller does that.
+
+Case 3 - a different map while the primary is resident (owned == 1 and
+model_map != g_model_host_base):
+  The outer if is taken, the inner is false, so control falls out of the
+  if/else chain to ds4_gpu_register_model_map_no_copy, exactly the path a
+  second map took before this unit. cuda_register_model_map
+  (ds4_cuda.cu:4021) then: releases the per-range/q8 caches; frees the primary
+  resident copy (cudaFree(g_model_device_base), g_model_device_owned = 0,
+  lines 4037-4039); unregisters the previous host registration; points
+  g_model_host_base at the new map; cudaHostRegisters it and sets
+  g_model_registered = 1. So the MTP/support map at ds4.c:73433 is registered
+  again and can never be skipped by an early success return. The primary's
+  resident copy does not survive the second registration (the pre-existing
+  "last map wins" replacement semantics of cuda_register_model_map, which
+  pre-unit had no device copy to free); see residual risks.
+
+ORPHAN CHECK of cuda_model_copy_chunked (task question):
+  The function never frees a prior g_model_device_base, so the question is
+  whether its cudaMalloc (line 2550) can ever run while a previous malloc'd
+  copy exists. It cannot, in the current tree: entry requires
+  g_model_device_owned == 0 AND g_model_registered == 0 (line 2545 early
+  return), g_model_device_owned is the only tracker for malloc'd copies and
+  is set to 1 only immediately after a successful malloc+copy (lines 2617,
+  3881), and every path that clears it frees first:
+  cuda_register_model_map lines 4037-4039 (cudaFree then owned = 0),
+  ds4_gpu_set_model_map lines 3850-3852, the shutdown/reset release lines
+  3017-3027 (cudaFree then pointers cleared). The caller guard closes the
+  remaining entrance: with owned == 1, case 2 returns and case 3 goes to
+  register, so copy_chunked is unreachable while anything is resident.
+  PLAINLY: no reachable call order orphans a previous resident copy today.
+  The order that would resurrect the leak is a direct call to
+  cuda_model_copy_chunked for map B while g_model_device_owned == 1 for map
+  A (bypassing both the scoped caller guard and the helper's own early
+  return): the malloc would overwrite g_model_device_base and A's copy would
+  leak. That is dormant, with both guards in place.
 
 
-SURFACE 8 - regressions (brief E), all sequential after the live checks
+CHECK 1 - Residency engages on this host (re-ran after the fix)
 
-Literal commands and key output (full logs in /tmp/qa-e-*.log via script /tmp/qa-e2b-e-check.sh):
-1. make pq2-0-test
-   EXIT=0; "pq2_0: all checks passed (6 reference blocks, 34 bytes/block, 2.125 bpw)"
-2. make test-qwen35-cuda
-   EXIT=0; "exact1 MMQ ... failures=0/6144: PASS", "exact1 MMVQ ... failures=0/6144: PASS",
-   "exact64 MMQ ... failures=0/1114112: PASS", "PQ2_0 CUDA parity: PASS"
-3. make bonsai-fold-selftest
-   EXIT=0; "fold selftest: blocks 2, 4 and 1024 match the explicit Hadamard matrix,
-   blocks stay independent, forward/inverse round-trips, and the gdn permutation
-   follows the tiled-to-grouped index map"
-4. make bonsai-ref-check
-   EXIT=0; tokens 5..16 are 11751 13 198 760 6511 314 9564 369 19241 13 198 760,
-   the same reference continuation the previous QA recorded (token 16 text " The").
-5. make test-qwen35-session DS4_TEST_MODEL=/data/models/Ternary-Bonsai-2-27B-PQ2_0.gguf
-   EXIT=0; 11 lines carrying PASS, 0 carrying FAIL: the 10 checks are plain
-   position/ids, prefix reuse position/ids, rewind position/replay, invalidate
-   empty/rebuild, context bound, plus the summary line "qwen35 session path: PASS".
-6. ./run-bonsai.sh compare
-   EXIT=0; cuda 13.31s / cpu 108.50s for 24 greedy tokens;
-   "IDENTICAL: all 24 generated token ids agree, so the CUDA graph"
-7. ./run-bonsai.sh session
-   EXIT=0; cuda (session) 13.37s / cpu 107.96s;
-   "IDENTICAL: all 24 generated token ids agree, so the session path"
-After the suite: nvidia-smi compute apps empty; no ds4 process left.
-Note recorded as requested: ds4.c is untouched by this unit (git diff dev --stat
-shows only ds4_server.c 9 insertions and run-bonsai.sh 69 changed lines), so these
-must be - and are - the same results the earlier QA recorded.
-Surface verdict: PASS.
+  ./ds4-bench --prompt-file /tmp/e2b-bench-prompt.txt -m /data/models/Ternary-Bonsai-2-27B-PQ2_0.gguf \
+      --cuda --ctx-start 64 --ctx-max 64 --ctx-alloc 256 --gen-tokens 16
+GPU before 273 MiB (free window). Log /tmp/qa2r-resident-bench.log:
+  ds4: CUDA chunk-copying 6.71 GiB model image
+  ds4: CUDA model chunk copy complete in 0.844s (6.70 GiB tensors)
+  ds4: CUDA startup model preparation covered 6.70 GiB of tensor spans in 0.000s
+  ds4: memory: KV 0.02 GiB ... + resident model 6.70 GiB = 6.72 GiB planned
+Exit 0, wall 5 s, peak 7613 MiB sampled every 0.2 s, no "registered ...
+  device access" line. Post-fix, the copy still happens and the startup
+  preparation still reports the image as handled.
+Verdict: PASS.
 
 
-TWO LITERAL BRIEF CRITERIA THAT DID NOT HOLD AT THE BRIEF'S BUDGETS (not hidden)
+CHECK 2 - Correctness unchanged (re-ran after the fix)
 
-1. Brief B, "each must finish with finish_reason stop" at max_tokens 40.
-   Observed: all three concurrent B responses returned finish_reason "length"; France
-   and Portugal contents stop before the city. Measured cause: the same prompts need
-   41-43 completion tokens at temperature 0 (B2: 42, 41, 43, all stop at 64). The
-   brief's budget is 1-3 tokens short; the server reports that honestly as "length".
-   Fix for a re-run of the gate as written: set max_tokens 48 or higher (the runbook's
-   own default is 64, which passes).
-2. Brief D, "must produce ... content deltas" at max_tokens 16.
-   Observed: reasoning deltas 16, content deltas 0, finish length for three prompts.
-   Measured cause: the think block alone is 33 tokens for this model/prompt, so content
-   starts at token 34; a 16-token budget cannot reach it. The same request at 64 tokens
-   produces role, 33 reasoning deltas, 8 content deltas, finish stop and [DONE] (D2).
-Both deviations are properties of the requested token budgets against a reasoning model
-at temperature 0, not of the unit under test: the unit changes no request handling,
-ds4.c is untouched, and every other property of those checks (own correct city, no
-crash, no cross-contamination, role/reasoning/finish/[DONE], clean shutdown) holds at
-the brief's own settings.
+  ./run-bonsai.sh compare "The capital of France is"
+  ./run-bonsai.sh session "The capital of France is"
+compare (exit 0, wall 110 s): cuda 2.30 s (resident; the 6.71 GiB chunk copy
+  is in its log), cpu 108.13 s, both continuations "Paris.\nThe capital of
+  Germany is Berlin.\nThe capital of Italy is Rome.\nThe capital of Spain is",
+  and "IDENTICAL: all 24 generated token ids agree, so the CUDA graph
+  reproduces the CPU reference on this prompt".
+session (exit 0, wall 116 s): cuda (session) 2.61 s (resident), cpu 113.35 s,
+  same continuation, "IDENTICAL: all 24 generated token ids agree, so the
+  session path reproduces the CPU reference on this prompt".
+Verdict: PASS.
 
-Small print found while running (reported, none of it a failure):
-- Per-request walls in B were 129.0-130.7s, slightly above the brief's 90-125s estimate;
-  the shape of the estimate (three serialized sessions) is right.
-- run-bonsai.sh line 29 still carries the header comment "the server path is a later
-  unit and is not wired into this script yet"; the status text and the usage block were
-  updated by the unit, that one sentence was not. Documentation only (the usage block
-  prints lines 2-13 and is correct).
-- A response cut inside the think block makes the server log "thinking not closed,
-  ignoring incomplete Qwen tool calls in reasoning" (seen in SURFACE 1 and SURFACE 4);
-  a parser note, no failure.
-- The server-side "finish=Xs" timer starts at session admission, not at curl dispatch,
-  so in B the server prints 128.98s / 103.39s / 104.26s while all three client walls
-  read about 129-131s. Explained, not an error.
-- The third queued prefill line reads "avg=0.04 t/s 27.598s" at chunk 1/59 because its
-  average includes the queue wait; its completed prefill is 26s of work behind it.
+
+CHECK 3 - Speedup real and reproducible (re-ran after the fix)
+
+Three resident-bench processes, free GPU:
+  64,64,27.22,16,27.54,38.480,15,27.73,0
+  64,64,27.12,16,27.16,38.096,15,27.30,0
+  64,64,27.20,16,27.49,37.258,15,27.61,0
+(columns: ctx, prefill_tokens, prefill_tps, gen_tokens, gen_tps, gen_first_ms,
+steady_tokens, steady_tps, kvcache_bytes.)
+Prefill 27.12-27.22 t/s, decode 27.16-27.54 t/s, first token 37.3-38.5 ms.
+Decode is inside the claimed 27-28 window; prefill sits at the top of the
+claimed 26-27 band and the first token 1-3 ms above the claimed 35-37 band
+(round 1 measured 35.1-38.5 across runs, so this is the same regime; the
+shared tenant had been active shortly before, which is the likely cause and
+is not proven). Still a 12x decode gain over the mapped path.
+Verdict: PASS (exact numbers reported; no claim of better than measured).
+
+
+CHECK 4 - Old behaviour restorable / env switches (re-ran after the fix)
+
+  DS4_CUDA_NO_MODEL_COPY=1 ./ds4-bench ... (same command as CHECK 1)
+Exit 0, wall 35 s, log /tmp/qa2r-nocopy-bench.log:
+  ds4: CUDA (no-copy) registered 6.71 GiB model mapping for multi-tier selective cache
+  CSV: 64,64,2.30,16,2.28,434.237,15,2.27,0 -> decode 2.27-2.30 t/s, first
+  token 434 ms, no chunk-copy line. Matches the 2.2-2.3 t/s requirement.
+The other three switches were re-run on the final code with a short bench
+  (ctx 8, gen 4), each printing the same no-copy registration line and
+  staying on the mapped path: DS4_CUDA_DIRECT_MODEL=1 2.17 t/s / 460 ms,
+  DS4_CUDA_WEIGHT_CACHE=1 2.19 t/s / 457 ms, DS4_CUDA_WEIGHT_PRELOAD=1
+  2.25 t/s / 446 ms (the shorter context explains the small drift from 2.28).
+Verdict: PASS.
+
+
+CHECK 5 - Suite and gate
+
+The full suite was run in round 1 on the pre-fix guard and is not re-run
+  here per the re-verification brief: exit 0, wall 147 s, 0 FAIL lines,
+  "tests/run.sh: overall PASS", all six steps OK (pq2-0-test,
+  test-qwen35-cuda, bonsai-fold-selftest, bonsai-ref-check,
+  test-qwen35-session, qa-gate). It still stands as evidence for the final
+  code because between round 1 and round 2 only the guard block inside
+  ds4_gpu_set_model_map_range changed (round-1 vs round-2 code diff hashes
+  above); every kernel, loader and test target is untouched by that delta,
+  and the guard's paths were re-verified live in CHECKs 1-4 and the case
+  walk-through above. Any suite statement that depends on the guard is
+  therefore covered by the post-fix runs, not by the round-1 suite.
+Gate, re-run now as requested against this report:
+  QA_MODEL=deepseek-v4.1-flash bash tests/qa-gate.sh
+  QA GATE: ALL PASS (no commits ahead of dev yet; nothing new to QA-tester)
+  exit status: 0
+  (Same expected message as round 1: dev and HEAD are the same commit while
+  the unit is uncommitted. Once committed, the surface scan looks for added
+  non-static function definitions and this unit's new function is static, so
+  it would again report nothing to QA-tester; this report documents the
+  three changed entry points regardless.)
+Verdict: PASS (gate exit 0; suite evidence annotated).
+
+
+CHECK 6 - Boundary honesty (updated: the does-not-fit branch is now live-verified)
+
+While another session's llama-server held 9158 MiB, the CHECK 1 command was
+  run and DECLINED residency by arithmetic, not by an env switch:
+  GPU before 9387 MiB; log /tmp/qa2-resident-bench.log shows
+  "ds4: CUDA (no-copy) registered 6.71 GiB model mapping for multi-tier
+  selective cache", no chunk-copy line, and NO "allocation skipped" line, so
+  the decline came from cuda_model_residency_fits before the malloc;
+  CSV 64,64,2.28,16,2.30,431.427,15,2.30,0, wall 36 s, exit 0, peak 9935 MiB.
+  The interrupted compare under the same pressure shows the same fallback on
+  the graph path: cuda 13.18 s / 1.82 t/s where the resident path takes 2.30 s.
+  The fit threshold for a 6.71 GiB image is free >= 1.5 GiB + 6.71*16/15 =
+  about 8.66 GiB; observed free was about 2.7 GiB there (declined) versus
+  about 11.9 GiB in the free window (engaged). The two live points bracket
+  the decision; the exact threshold was not bisected.
+Loader failures, re-confirmed as pre-existing (ds4.c is untouched by the
+  diff; these fail at weight binding before any device mapping - their logs
+  contain no chunk-copy/registration/CUDA-init line):
+  Qwen3.8-27B-GSQ-RCO-IQ3_XXS.gguf -> "ds4: tensor token_embd.weight has
+    type 22, expected pq2_0", exit 1 in 1 s.
+  Qwen3.8-9B-Q4_K_M.gguf -> "ds4: expected block_count=64 for Prism Bonsai 2
+    27B, got 33", exit 1 in 0 s.
+  Ternary-Bonsai-2-27B-PTQ1_0.gguf (not listed in the brief) -> 402
+    "unsupported GGUF type 143" warnings then "tensor token_embd.weight has
+    type 143, expected pq2_0", exit 1, no device mapping.
+  --ssd-streaming on the Bonsai GGUF -> family refusal "Bonsai (qwen35) runs
+    on the CPU reference ... or on single-GPU CUDA ...; tensor parallelism,
+    SSD streaming, DSpark/MTP and steering are not supported", exit 1 in 1 s,
+    before any CUDA work.
+Not live-exercised, code reading only: n_gpus > 1 (single physical GPU);
+  the g_ssd_streaming_mode decline inside the helper (the engine refuses the
+  flag earlier); cases 1b/2/3 of the guard (need a second/third map call,
+  i.e. an MTP-capable model - none installed, and the Bonsai family refuses
+  MTP). --simulate-used-memory cannot help: it is a host-side mmap+mlock
+  (ds4_ssd.c:142-201) that does not reduce CUDA free memory.
+Verdict: PASS (the boundary story is stronger than round 1: the does-not-fit
+  decline is now observed live under real memory pressure).
+
 
 COULD NOT VERIFY (accepted risks)
 
-- The mixed prefill/decode overlap was never triggered. In every server log captured for
-  this QA (checks A, B, B2, C, D, D2, F1, F3b and the F4 attempt) the only occurrence of
-  "mixed" is the startup configuration value mixed_prefill_quantum=128 in the
-  batched-mode line where one exists; no request produced a mixed-phase line. The brief
-  records that the previous run saw no occurrence either. What this does not prove: that
-  the overlap path is correct; only that it did not engage under these requests on this
-  build.
-- The non-Bonsai families with the new code: the notice is inside the
-  "if (cfg.kv_disk_dir)" branch and additionally gated on ds4_engine_is_qwen35(engine)
-  (ds4_server.c:15794-15806 read directly), so for any other engine nothing executes.
-  No DeepSeek or GLM model is installed, so this is code-level reasoning, not a live run.
-- Long generations and long chats for this family: not exercised (the brief forbids
-  queueing long generations on this slow shared GPU); the longest answer generated in
-  this QA was 43 tokens.
-- Four or more concurrent requests: only 2 and 3 concurrent requests were exercised
-  (plus the 4-slot server with two requests). A 4-request burst was not run.
-- The report file is the only repo change the QA makes; no source, Makefile or script
-  was modified, and the working tree after the run is still exactly the unit's two
-  modified files plus this rewritten report.
+- The MTP/support second-map call (ds4.c:73433) live: no MTP-capable model is
+  installed and the Bonsai family refuses MTP/DSpark, so cases 2 and 3 are
+  code reading, not live runs.
+- The n_gpus > 1 decline: single physical GPU on this host.
+- The g_ssd_streaming_mode decline inside the helper: the engine refuses
+  --ssd-streaming for this family before the CUDA path.
+- Non-Bonsai families on CUDA (DeepSeek V4, GLM): no model files installed.
+- The 1.5 GiB reserve adequacy is design-asserted; the does-not-fit live point
+  is a single bracket, not a bisected threshold.
+- The round-1 comment figures (16.8 GB/s PCIe, 504 GB/s device) were not
+  re-measured; this QA measures only the on/off delta, memory and the
+  boundary behaviour.
+
+
+RESIDUAL RISKS (updated after the fix)
+
+1. RESOLVED - the flagged defect: the early return is scoped to
+   model_map == g_model_host_base, and a different map falls through to
+   ds4_gpu_register_model_map_no_copy, so the MTP/support map at ds4.c:73433
+   is registered again exactly as before this unit.
+2. Case 1b silent success (latent, currently unreachable): if a third
+   set_model_map_range call arrives while owned == 0 and registered == 1,
+   cuda_model_copy_chunked returns 1 without copying and the caller reports
+   success although the new map was neither copied nor registered. On CUDA
+   an engine has at most two map calls (primary at ds4.c:73399, MTP at
+   73433; vision uses ds4_gpu_set_aux_model_map_range on Linux, the two
+   __APPLE__ branches are not compiled here, and the CLI vision dump at
+   ds4.c:74174 is a separate single-map process). Latent if a third map call
+   is ever added on CUDA.
+3. Case 3 frees the primary resident copy when a second map is registered
+   (cuda_register_model_map frees before replacing). Consequence: for a
+   fitting primary plus an MTP model, the primary reverts to the mapped path
+   after the MTP registration. This is the pre-unit "last map wins" behaviour
+   and is not a regression, but the residency gain is lost in that
+   configuration; the same-map/one-map case that was measured is unaffected.
+4. Orphan/double-alloc remains dormant: cuda_model_copy_chunked cannot
+   allocate while anything is owned or registered, and all replacement paths
+   free first. The order that would revive the leak is a direct
+   cuda_model_copy_chunked call for a second map while a first copy is owned,
+   bypassing both guards.
+5. Timing drift under the shared GPU: the re-run first token (37.3-38.5 ms)
+   is slightly above the 35-37 ms brief and round-1 values; the other tenant
+   had been active shortly before, which is the likely cause and is not
+   proven.
+6. No leaks or strays: after every run nvidia-smi returned to the ambient
+   level (273-276 MiB in free windows, the tenant's own usage otherwise) and
+   pgrep -a ds4 found nothing; the teardown path frees the 6.70 GiB copy.
 
 verdict: overall PASS
