@@ -69120,6 +69120,18 @@ static int qwen35_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
         free(seq);
         return 1;
     }
+    /* DS4_QWEN35_TOKENS is free-form input: an id past the vocabulary would
+     * read an embedding row outside the table (the mmap makes it a silent
+     * wrong tensor, or a fault for a large enough id).  Refuse it here, at the
+     * input boundary, rather than inside the reference forward. */
+    for (uint32_t t = 0; t < n_seq; t++) {
+        if (seq[t] < 0 || seq[t] >= (int)V) {
+            fprintf(stderr, "ds4: Bonsai token id %d is outside the vocabulary (0..%u)\n",
+                    seq[t], V - 1u);
+            free(seq);
+            return 1;
+        }
+    }
 
     const char *steps_env = getenv("DS4_QWEN35_STEPS");
     uint32_t steps = steps_env && steps_env[0] ? (uint32_t)atoi(steps_env) : 16u;
