@@ -1709,13 +1709,18 @@ __global__ void gdn_scan(float *out, float *state, const float *qkv,
         for (unsigned i = 0; i < npt; i++) state[idx+(uint64_t)r*D+i] = s[r][i];
 }
 
-__global__ void gdn_out(float *o, const float *z, const float *w, unsigned H, unsigned D, float eps) {
+__global__ void gdn_out(float *o, const float *z, const float *w, unsigned H, unsigned D, float eps,
+                        unsigned gate_silu) {
     const unsigned h = blockIdx.x, t = blockIdx.y, npt = D / 32, k0 = threadIdx.x * npt;
     const uint64_t idx = ((uint64_t)t * H + h) * D + k0;
     float ss = 0;
     for (unsigned i = 0; i < npt; i++) ss += o[idx + i] * o[idx + i];
     const float r = rsqrtf(sum(ss) / D + eps);
-    for (unsigned i = 0; i < npt; i++) o[idx + i] = o[idx + i] * r * w[k0 + i] * sigmoid(z[idx + i]);
+    for (unsigned i = 0; i < npt; i++) {
+        /* qwen4exp gates this norm with sigmoid, the Bonsai trunk with silu. */
+        const float gate = gate_silu ? silu(z[idx + i]) : sigmoid(z[idx + i]);
+        o[idx + i] = o[idx + i] * r * w[k0 + i] * gate;
+    }
 }
 
 __global__ void ngram_gate(float *gated, float *normed, const float *R, const float *key,
@@ -1823,7 +1828,7 @@ extern "C" int ds4_gpu_qwen4_gdn_out_tensor(ds4_gpu_tensor *out, const ds4_gpu_t
     if (!n || D < 32 || D > 128 || D % 32 || !tensor(out, n * 4) || !tensor(z, n * 4)) return 0;
     const char *w = weight(map, size, off, (uint64_t)D * 4);
     if (!w) return 0;
-    gdn_out<<<dim3(H, T), 32, 0, cuda_decode_stream()>>>((float *)out->ptr, (const float *)z->ptr, (const float *)w, H, D, eps);
+    gdn_out<<<dim3(H, T), 32, 0, cuda_decode_stream()>>>((float *)out->ptr, (const float *)z->ptr, (const float *)w, H, D, eps, 0u);
     return launched();
 }
 

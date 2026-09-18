@@ -27,26 +27,26 @@ keeps ds4 self-contained at the cost of a periodic re-sync.
 
 | File                  | Origin in llama.cpp                          | Status                                                                   | Lines |
 |-----------------------|----------------------------------------------|--------------------------------------------------------------------------|-------|
-| `mmq.cuh`             | `ggml/src/ggml-cuda/mmq.cuh`                 | verbatim                                                                 |  4176 |
+| `mmq.cuh`             | `ggml/src/ggml-cuda/mmq.cuh`                 | patched: `load_tiles_pq2_0`, PQ2_0 tile sizes + `mmq_type_traits` (see "ds4-local quant types") |  4595 |
 | `mma.cuh`             | `ggml/src/ggml-cuda/mma.cuh`                 | verbatim                                                                 |  1456 |
-| `vecdotq.cuh`         | `ggml/src/ggml-cuda/vecdotq.cuh`             | verbatim                                                                 |  1317 |
+| `vecdotq.cuh`         | `ggml/src/ggml-cuda/vecdotq.cuh`             | patched: `VDR_PQ2_0_Q8_1_*`, `ds4_pq2_0_expand_byte`, `vec_dot_pq2_0_q8_1` |  1360 |
 | `quantize.cuh`        | `ggml/src/ggml-cuda/quantize.cuh`            | verbatim                                                                 |    41 |
 | `quantize.cu`         | `ggml/src/ggml-cuda/quantize.cu`             | verbatim                                                                 |   443 |
 | `mmid.cuh`            | `ggml/src/ggml-cuda/mmid.cuh`                | verbatim                                                                 |     5 |
 | `mmid.cu`             | `ggml/src/ggml-cuda/mmid.cu`                 | verbatim                                                                 |   164 |
 | `mmvq.cuh`            | `ggml/src/ggml-cuda/mmvq.cuh`                | patched (Step 6): `mul_mat_vec_q_switch_type` proto exposed; ggml-tensor entries gated on `DS4_MMVQ_INCLUDE_GGML_ENTRIES` | ~36 |
-| `mmvq.cu`             | `ggml/src/ggml-cuda/mmvq.cu`                 | patched: `mul_mat_vec_q_switch_type` promoted from `static`; `ggml_cuda_mul_mat_vec_q` + `ggml_cuda_op_mul_mat_vec_q` gated on `DS4_MMVQ_INCLUDE_GGML_ENTRIES` | 1163 |
+| `mmvq.cu`             | `ggml/src/ggml-cuda/mmvq.cu`                 | patched: `mul_mat_vec_q_switch_type` promoted from `static`; `ggml_cuda_mul_mat_vec_q` + `ggml_cuda_op_mul_mat_vec_q` gated on `DS4_MMVQ_INCLUDE_GGML_ENTRIES`; PQ2_0 dispatch cases | 1191 |
 | `unary.cuh`           | `ggml/src/ggml-cuda/unary.cuh`               | verbatim (needed by `mmvq.cu` for inline GLU epilogues)                  |   114 |
-| `common.cuh`          | `ggml/src/ggml-cuda/common.cuh`              | verbatim                                                                 |  1489 |
-| `ggml-common.h`       | `ggml/src/ggml-common.h`                     | verbatim                                                                 |  1900 |
+| `common.cuh`          | `ggml/src/ggml-cuda/common.cuh`              | patched: `ggml_cuda_type_traits<GGML_TYPE_PQ2_0>`                        |  1497 |
+| `ggml-common.h`       | `ggml/src/ggml-common.h`                     | patched: `block_pq2_0` + `QK2_0`/`QI_PQ2_0`/`QR_PQ2_0`                   |  1915 |
 | `vendors/cuda.h`      | `ggml/src/ggml-cuda/vendors/cuda.h`          | verbatim                                                                 |    28 |
 | `ggml.h`              | (new)                                        | redirect to `ds4_ggml_stubs.h`                                           |     5 |
 | `ggml-impl.h`         | (new)                                        | redirect to `ds4_ggml_stubs.h`                                           |     5 |
 | `ggml-cuda.h`         | (new)                                        | redirect to `ds4_ggml_stubs.h`                                           |     5 |
-| `ds4_ggml_stubs.h`    | (new)                                        | shim: ggml_type enum, macros, info struct, type_size lookups             | ~280 |
+| `ds4_ggml_stubs.h`    | (new)                                        | shim: ggml_type enum, macros, info struct, type_size lookups             |  310 |
 | `ds4_ggml_stubs.cu`   | (new)                                        | shim impls: `ggml_cuda_info`, naive pool, `ggml_backend_cuda_context::*` | ~110 |
-| `ds4_mmq.h`           | (new)                                        | public C ABI for ds4 to call                                             |  ~70 |
-| `ds4_mmq.cu`          | (new)                                        | host wrappers; Phase 0 instantiates `mul_mat_q_case<Q8_0>` only          | ~120 |
+| `ds4_mmq.h`           | (new)                                        | public C ABI for ds4 to call                                             |  931 |
+| `ds4_mmq.cu`          | (new)                                        | host wrappers for the dense/MoE entries and their `mul_mat_q_case` instantiations | 5022 |
 
 **Total vendored:** ~11,000 lines of CUDA. **Total shim/adapter:** ~600 lines.
 
@@ -92,6 +92,37 @@ Symbols the vendored files reference, and how they resolve in this directory:
 - **The full `ggml_tensor` type.** No tensor introspection - shapes and strides come in via raw arguments to `ds4_mmq_*`.
 - **`ggml_op` graph evaluation.** We call kernels directly.
 
+## ds4-local quant types (Prism PQ2_0)
+
+llama.cpp has no PQ2_0, so the type is a ds4-local addition that the
+re-sync procedure below must reapply by hand. It is the ternary Bonsai
+matmul format: 128 values per block, one fp16 scale then 32 code bytes,
+value j in byte j/4 at bits (j % 4)*2 and level = code - 1, i.e. the
+alphabet -d, 0, +d, +2d. The reference is `pq2_0_row_f32` in `ds4.c`.
+
+The integration touches, in order:
+
+| File            | Addition                                                                                     |
+|-----------------|----------------------------------------------------------------------------------------------|
+| `ggml-common.h` | `block_pq2_0`, `QK2_0` (128), `QI_PQ2_0` (8), `QR_PQ2_0` (4)                                  |
+| `common.cuh`    | `ggml_cuda_type_traits<GGML_TYPE_PQ2_0>`                                                      |
+| `vecdotq.cuh`   | `VDR_PQ2_0_Q8_1_MMVQ` (1), `VDR_PQ2_0_Q8_1_MMQ` (8), `ds4_pq2_0_expand_byte`, `vec_dot_pq2_0_q8_1` |
+| `mmq.cuh`       | ds-layout / dp4a-tile-size / mma-tile-k cases, `load_tiles_pq2_0`, `mmq_type_traits<...,PQ2_0>` |
+| `mmvq.cu`       | `get_vec_dot_q_cuda`, `get_vdr_mmvq` and `mul_mat_vec_q_switch_type` cases                    |
+
+Two design points make the surface small: the 2-bit codes are exact small
+integers, and a code byte holds exactly the four levels of four consecutive
+values, so expanding a byte to the four int8 lanes a dp4a/mma step wants is a
+byte permutation (`0xff, 0x00, 0x01, 0x02`). The MMQ tile is therefore laid
+out exactly like Q8_0's (one int8 per value, one float scale per 32 values)
+and reuses `vec_dot_q8_0_q8_1_dp4a` / `_mma` verbatim; the row lookup is the
+ds4-owned `ds4_mmq_pq2_0_rows_f32` kernel. The parity test is
+`make test-qwen35-cuda` (`tests/test_qwen35_cuda.cu`).
+
+The type id is 142, above `GGML_TYPE_COUNT`, matching
+`DS4_TENSOR_PQ2_0` in `ds4.c` - the same convention MXFP4 (39), NVFP4 (40)
+and Q1_0 (41) already use.
+
 ## Re-syncing with upstream
 
 When upstream lands a bugfix or perf improvement we want, the procedure is:
@@ -125,6 +156,7 @@ upstream adds a new helper), extend `ds4_ggml_stubs.h`.
 | MoE `_id` Q2_K parity                         | **passes** (3 shapes)        | Phase 4   |
 | MoE `_id` IQ2_XXS parity                      | **passes** (4 shapes)        | Phase 4   |
 | `make ds4-bench` with mmq integration         | **builds and runs**          | Phase 5/6 |
+| PQ2_0 row lookup + dense (MMQ/MMVQ) vs ds4 CPU reference | **passes** (`make test-qwen35-cuda`) | Bonsai Phase A |
 | Frontier sweep, ctx 2k-16k, V4 Flash IQ2XXS   | **see results below**        | Phase 7   |
 
 ## Validated performance
