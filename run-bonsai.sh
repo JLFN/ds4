@@ -7,6 +7,7 @@
 #         ./run-bonsai.sh --cpu "prompt"  run the CPU reference instead of the GPU
 #         ./run-bonsai.sh compare [prompt]  both backends, diffed token for token
 #         ./run-bonsai.sh session [prompt]  the CUDA session path, diffed against the reference
+#         ./run-bonsai.sh server [prompt]   one chat request through ds4-server
 #         ./run-bonsai.sh bench [tokens]    decode rate (default 16 tokens)
 #         ./run-bonsai.sh status            what is installed and what can run
 #         ./run-bonsai.sh help
@@ -177,6 +178,68 @@ session_mode() {
   fi
 }
 
+# One real request through the OpenAI-compatible server: start it, wait for the
+# listener, ask a chat question through the model's own ChatML template, print
+# the answer and stop the server.  DS4_BONSAI_PORT and DS4_BONSAI_CTX override
+# the port and the allocated context.
+server_mode() {
+  check_env
+  local port="${DS4_BONSAI_PORT:-8899}"
+  local ctx="${DS4_BONSAI_CTX:-4096}"
+  local slog="$LOG.server"
+  [ -x "$BIN-server" ] || die "server binary not found at $BIN-server (build it: cd /data/ds4 && make ds4-server CUDA_ARCH=native)"
+  echo "model:   $MODEL"
+  echo "prompt:  $PROMPT"
+  echo "ctx:     $ctx on port $port"
+  echo
+  rm -f "$slog"
+  "$BIN-server" -m "$MODEL" --cuda -c "$ctx" --port "$port" > "$slog" 2>&1 &
+  local pid=$!
+  local waited=0
+  while [ "$waited" -lt 180 ]; do
+    grep -q "listening on" "$slog" 2>/dev/null && break
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "server exited before listening (exit status above); last lines:"
+      tail -5 "$slog"
+      return 1
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  if ! grep -q "listening on" "$slog"; then
+    echo "server did not start listening within ${waited}s; last lines:"
+    tail -5 "$slog"
+    kill "$pid" 2>/dev/null
+    return 1
+  fi
+  echo "server:  up (pid $pid), $(grep -o 'listening on.*' "$slog" | tail -1)"
+  echo
+  local t0 t1 wall body
+  t0=$(date +%s.%N)
+  body=$(curl -s -m 600 "http://127.0.0.1:$port/v1/chat/completions" \
+      -H 'Content-Type: application/json' \
+      -d "{\"model\":\"prism-bonsai-2-27b\",\"messages\":[{\"role\":\"system\",\"content\":\"You are a helpful assistant\"},{\"role\":\"user\",\"content\":\"$PROMPT\"}],\"max_tokens\":64,\"temperature\":0}")
+  t1=$(date +%s.%N)
+  wall=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b-a}')
+  echo "wall:    ${wall}s for the request"
+  printf '%s' "$body" | python3 -c '
+import json,sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("raw response:", sys.stdin.read()[:400]); raise SystemExit(0)
+c = d["choices"][0]["message"]
+print("answer:  ", (c.get("content") or "").strip())
+rc = (c.get("reasoning_content") or "").strip()
+if rc: print("reasoning:", rc[:240])
+print("tokens:  ", d.get("usage"))
+'
+  kill "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null
+  echo
+  echo "server:  stopped (log at $slog)"
+}
+
 status_mode() {
   echo "binary:  $BIN"
   if [ -x "$BIN" ]; then
@@ -207,12 +270,11 @@ status_mode() {
     echo "model:   $("$BIN" -m "$MODEL" --inspect 2>/dev/null | grep -E '^arch|logical parameters' | tr '\n' ' ')"
   fi
   echo "entry:   --first-token-test (greedy diagnostic) and the plain CLI"
-  echo "         generation, which now runs the CUDA session path; the server"
-  echo "         path is a later unit and is not wired into this script yet."
+  echo "         generation and ds4-server chat, both on the CUDA session path."
 }
 
 usage() {
-  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # --- argument parsing -------------------------------------------------------
@@ -220,6 +282,7 @@ PROMPT="$DEFAULT_PROMPT"
 case "${1:-}" in
   compare)        shift; [ $# -gt 0 ] && PROMPT="$*"; compare_mode ;;
   session)        shift; [ $# -gt 0 ] && PROMPT="$*"; session_mode ;;
+  server)         shift; [ $# -gt 0 ] && PROMPT="$*"; server_mode ;;
   bench)          shift; bench_mode "${1:-16}" ;;
   status)         status_mode ;;
   help|-h|--help) usage ;;
