@@ -3557,6 +3557,24 @@ int ds4_gpu_qwen35_fold_inverse_tensor(
         ds4_gpu_tensor *x, uint32_t n, uint32_t n_tok, uint32_t block_size,
         const ds4_gpu_tensor *signs);
 
+/* Gated output norm of the linear (gdn) layer, silu-gated as this family
+ * applies it; z holds n_tok rows of H*D and the gamma is lin_norm (D floats). */
+int ds4_gpu_qwen35_gdn_out_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *z,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t n_tokens, uint32_t n_head, uint32_t head_dim, float eps);
+/* Per-head q (+ raw gate) and k (norm + partial rope) prep with the v store;
+ * the k/v caches are fp16 [cap][n_head_kv][head_dim].  pos3 holds four
+ * positions per cached row, all the same value in a text-only model. */
+int ds4_gpu_qwen35_attn_prep_tensor(
+        ds4_gpu_tensor *q, ds4_gpu_tensor *gate, ds4_gpu_tensor *k_cache,
+        ds4_gpu_tensor *v_cache, const ds4_gpu_tensor *qg,
+        const ds4_gpu_tensor *kp, const ds4_gpu_tensor *vp,
+        const ds4_gpu_tensor *pos3, const void *model_map, uint64_t model_size,
+        uint64_t q_norm_offset, uint64_t k_norm_offset, uint32_t n_tokens,
+        uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t n_rot,
+        uint32_t pos0, uint32_t cache_cap, float rope_base, float eps);
+
 #ifdef __cplusplus
 }
 #endif

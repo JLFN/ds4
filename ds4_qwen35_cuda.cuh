@@ -148,3 +148,58 @@ extern "C" int ds4_gpu_qwen35_fold_inverse_tensor(
     return ds4_qwen35_fold_launch(x, n, n_tok, block_size, signs, /*gdn=*/0,
                                   0, 0, 0, /*inverse=*/1);
 }
+
+/* Gated output norm of the Bonsai linear layer: the qwen4 kernel with the
+ * silu gate this family uses (ds4_qwen35_ref_linear) instead of sigmoid. */
+extern "C" int ds4_gpu_qwen35_gdn_out_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *z,
+        const void *map, uint64_t size, uint64_t off, uint32_t T, uint32_t H,
+        uint32_t D, float eps) {
+    const uint64_t n = (uint64_t) T * H * D;
+    if (!n || D < 32 || D > 128 || D % 32 || !qwen35_cuda::tensor(out, n * 4) ||
+        !qwen35_cuda::tensor(z, n * 4)) {
+        return 0;
+    }
+    const char *w = cuda_resolve_weight_ptr(map, off, (uint64_t) D * 4, 0, "Bonsai lin_norm");
+    if (!w) return 0;
+    qwen4_cuda::gdn_out<<<dim3(H, T), 32, 0, cuda_decode_stream()>>>(
+        (float *) out->ptr, (const float *) z->ptr, (const float *) w, H, D,
+        eps, /*gate_silu=*/1u);
+    return qwen35_cuda::launched("Bonsai gdn out");
+}
+
+/* Attention prep of the Bonsai full-attention layer: the qwen4 kernel with no
+ * indexer slot (this model has no sparse indexer), so it produces the roped
+ * q with its raw sigmoid gate, the roped k and the v store.  The q and k
+ * per-head norms both carry a gamma of length D and the same eps. */
+extern "C" int ds4_gpu_qwen35_attn_prep_tensor(
+        ds4_gpu_tensor *q, ds4_gpu_tensor *gate, ds4_gpu_tensor *kc,
+        ds4_gpu_tensor *vc, const ds4_gpu_tensor *qg, const ds4_gpu_tensor *kp,
+        const ds4_gpu_tensor *vp, const ds4_gpu_tensor *pos3,
+        const void *map, uint64_t size, uint64_t qo, uint64_t ko, uint32_t T,
+        uint32_t H, uint32_t Hkv, uint32_t D, uint32_t nrot, uint32_t pos0,
+        uint32_t cap, float base, float eps) {
+    using namespace qwen35_cuda;
+    const uint64_t qb = (uint64_t) T * H * D * 4, kb = (uint64_t) T * Hkv * D * 4;
+    if (!T || !H || !Hkv || H % Hkv || D < 32 || D > 256 || D % 32 ||
+        nrot > 64 || nrot > D || nrot % 2 || (uint64_t) pos0 + T > cap ||
+        !tensor(q, qb) || !tensor(gate, qb) || !tensor(qg, qb * 2) ||
+        !tensor(kp, kb) || !tensor(vp, kb) ||
+        !tensor(kc, (uint64_t) cap * Hkv * D * 2) ||
+        !tensor(vc, (uint64_t) cap * Hkv * D * 2) ||
+        !tensor(pos3, (uint64_t) cap * 16)) {
+        return 0;
+    }
+    const char *gq = cuda_resolve_weight_ptr(map, qo, (uint64_t) D * 4, 0, "Bonsai attn_q_norm");
+    const char *gk = cuda_resolve_weight_ptr(map, ko, (uint64_t) D * 4, 0, "Bonsai attn_k_norm");
+    if (!gq || !gk) return 0;
+    qwen4_cuda::attn_prep<<<dim3(H + Hkv, T), 32, 0, cuda_decode_stream()>>>(
+        (float *) q->ptr, (float *) gate->ptr, (__half *) kc->ptr,
+        (__half *) vc->ptr, /*iqout=*/NULL, /*ikc=*/NULL,
+        (const float *) qg->ptr, (const float *) kp->ptr,
+        (const float *) vp->ptr, /*iq=*/NULL, /*ik=*/NULL,
+        (const uint32_t *) pos3->ptr, (const float *) gq, (const float *) gk,
+        /*giq=*/NULL, H, Hkv, D, /*Hi=*/0, /*Di=*/0, pos0, eps,
+        qwen4_cuda::rope(nrot, base));
+    return launched("Bonsai attn prep");
+}

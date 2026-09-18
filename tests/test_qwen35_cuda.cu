@@ -738,6 +738,83 @@ bool test_host_wiring() {
     return ok;
 }
 
+/* 5. GDN output norm gates.  The kernel is shared with the qwen4 family, so
+ * both gates are checked against a double-precision reference: sigmoid (the
+ * qwen4exp call) and silu (this family).  A kernel that ignored the selector
+ * would fail one of the two. */
+bool test_gdn_out_gates() {
+    constexpr uint32_t T = 3, H = 48, D = 128;
+    constexpr float eps = 1e-6f;
+    const uint64_t n = (uint64_t)T * H * D;
+    const uint64_t arena_bytes = (uint64_t)1 << 20;
+
+    void *arena = mmap(nullptr, arena_bytes, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (arena == MAP_FAILED) return false;
+    std::vector<float> gamma(D);
+    for (uint32_t i = 0; i < D; i++) gamma[i] = 0.5f + 0.5f * std::fabs(frand());
+    std::memcpy(arena, gamma.data(), D * sizeof(float));
+
+    std::vector<float> z(n), base(n);
+    for (uint64_t i = 0; i < n; i++) {
+        z[i] = 4.0f * frand();
+        base[i] = frand();
+    }
+
+    ds4_gpu_tensor *gout = ds4_gpu_tensor_alloc(n * sizeof(float));
+    ds4_gpu_tensor *gz = ds4_gpu_tensor_alloc(n * sizeof(float));
+    bool ok = gout && gz &&
+        ds4_gpu_tensor_write(gz, 0, z.data(), n * sizeof(float));
+    if (!ok) {
+        std::fprintf(stderr, "gdn out: tensor setup failed\n");
+        ds4_gpu_tensor_free(gout);
+        ds4_gpu_tensor_free(gz);
+        munmap(arena, arena_bytes);
+        return false;
+    }
+
+    for (int silu = 0; silu <= 1; silu++) {
+        std::vector<float> want(n), got(n);
+        for (uint32_t t = 0; t < T; t++) {
+            for (uint32_t h = 0; h < H; h++) {
+                const uint64_t base_i = ((uint64_t)t * H + h) * D;
+                double ss = 0.0;
+                for (uint32_t i = 0; i < D; i++) {
+                    ss += (double)base[base_i + i] * (double)base[base_i + i];
+                }
+                const double r = 1.0 / std::sqrt(ss / D + eps);
+                for (uint32_t i = 0; i < D; i++) {
+                    const double zv = z[base_i + i];
+                    const double sig = 1.0 / (1.0 + std::exp(-zv));
+                    const double gate = silu ? zv * sig : sig;
+                    want[base_i + i] = (float)(base[base_i + i] * r * gamma[i] * gate);
+                }
+            }
+        }
+        const bool ran =
+            ds4_gpu_tensor_write(gout, 0, base.data(), n * sizeof(float)) &&
+            (silu ? ds4_gpu_qwen35_gdn_out_tensor(gout, gz, arena, arena_bytes, 0,
+                                                  T, H, D, eps) != 0
+                  : ds4_gpu_qwen4_gdn_out_tensor(gout, gz, arena, arena_bytes, 0,
+                                                 T, H, D, eps) != 0) &&
+            ds4_gpu_tensor_read(gout, 0, got.data(), n * sizeof(float));
+        if (!ran) {
+            std::fprintf(stderr, "gdn out: %s run failed\n", silu ? "silu" : "sigmoid");
+            ok = false;
+            continue;
+        }
+        char label[128];
+        std::snprintf(label, sizeof(label), "gdn out norm, %s gate",
+                      silu ? "silu (Bonsai)" : "sigmoid (qwen4exp)");
+        ok = close_enough(got, want, 1e-5f, 1e-4f, label) && ok;
+    }
+
+    ds4_gpu_tensor_free(gout);
+    ds4_gpu_tensor_free(gz);
+    munmap(arena, arena_bytes);
+    return ok;
+}
+
 } // namespace
 
 int main() {
@@ -750,6 +827,7 @@ int main() {
     const bool guards_ok = test_shape_guards();
     const bool host_ok = test_host_wiring();
     const bool fold_ok = test_fold_transform();
+    const bool gdn_ok = test_gdn_out_gates();
 
     /* Random activations: the kernels quantize the activation to the Q8_1
      * form, so the outputs are compared by relative L2 error against the
@@ -773,7 +851,8 @@ int main() {
     }
     exact_ok = run_shape(kShapes[0], 64, "exact64", true) && exact_ok;
 
-    const bool ok = rows_ok && guards_ok && host_ok && fold_ok && shapes_ok && exact_ok;
+    const bool ok = rows_ok && guards_ok && host_ok && fold_ok && gdn_ok &&
+                    shapes_ok && exact_ok;
     std::fprintf(stderr, "PQ2_0 CUDA parity: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
