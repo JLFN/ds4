@@ -2351,6 +2351,9 @@ static const gguf_type_info gguf_types[] = {
     [29] = {"iq1_m",  256,  56},
     [30] = {"bf16",     1,   2},
     [39] = {"mxfp4",   32,  17},
+    /* Prism "PQ2_0": 128 weights per block, one fp16 scale, 2 bits per weight,
+     * codes 0..3 meaning -d, 0, +d, +2d.  Used by the Bonsai ternary models. */
+    [142] = {"pq2_0", 128,  34},
 };
 
 enum {
@@ -2369,6 +2372,7 @@ enum {
     DS4_TENSOR_I32      = 26,
     DS4_TENSOR_BF16     = 30,
     DS4_TENSOR_MXFP4    = 39,
+    DS4_TENSOR_PQ2_0    = 142,
 };
 
 typedef struct {
@@ -67076,6 +67080,22 @@ static void qwen4_ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row,
             for (uint32_t j = 0; j < 16u; j++) {
                 out[b * 32u + j] = d * ds4_mxfp4_values[p[1 + j] & 0x0fu];
                 out[b * 32u + 16u + j] = d * ds4_mxfp4_values[p[1 + j] >> 4];
+            }
+        }
+        break;
+    }
+    case DS4_TENSOR_PQ2_0: {
+        /* Bonsai ternary: one fp16 scale per 128 weights, 2-bit codes, element
+         * j in byte j/4 at bits (j%4)*2 (LSB first), level = code - 1. */
+        const uint64_t blocks = n / 128u;
+        const uint8_t *p = (const uint8_t *)tensor_data(m, t) + row * blocks * 34u;
+        for (uint64_t b = 0; b < blocks; b++, p += 34u) {
+            uint16_t dh;
+            memcpy(&dh, p, sizeof(dh));
+            const float d = f16_to_f32(dh);
+            for (uint32_t j = 0; j < 128u; j++) {
+                const uint8_t code = (uint8_t)((p[2u + (j >> 2)] >> (2u * (j & 3u))) & 3u);
+                out[b * 128u + j] = (float)((int)code - 1) * d;
             }
         }
         break;

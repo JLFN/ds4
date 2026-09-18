@@ -1041,6 +1041,12 @@ mxfp4-dot-test: tests/test_mxfp4_dot.c
 	$(CC) -O2 -Wall -Wextra -std=c99 -o tests/test_mxfp4_dot tests/test_mxfp4_dot.c -lm
 	./tests/test_mxfp4_dot
 
+# PQ2_0 block format (Prism/Bonsai ternary): bytes and expected values in the
+# test come from the reference dequantizer in the PrismML llama.cpp fork.
+pq2-0-test: tests/test_pq2_0.c
+	$(CC) -O2 -Wall -Wextra -std=c99 -o tests/test_pq2_0 tests/test_pq2_0.c -lm
+	./tests/test_pq2_0
+
 .PHONY: test-download-model
 test-download-model:
 	python3 tests/test_model_download.py
