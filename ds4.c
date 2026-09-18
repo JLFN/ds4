@@ -43698,7 +43698,10 @@ static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_ve
         bpe_tokenize_text_glm4(vocab, text, out);
         return;
     }
-    if (ds4_model_is_qwen4()) {
+    /* Qwen3.8 and Bonsai carry tokenizer.ggml.pre = "qwen35", whose ordered
+     * alternation keeps combining marks with their letters; the DeepSeek rules
+     * below would split them. */
+    if (ds4_model_is_qwen4() || ds4_model_is_qwen35()) {
         bpe_tokenize_text_qwen35(vocab, text, out);
         return;
     }
@@ -43954,36 +43957,52 @@ static void chat_push_think_prefix(const ds4_vocab *vocab,
             token_vec_push(out, vocab->system_id);
             bpe_tokenize_text(vocab, effort, out);
         }
+    } else if (ds4_model_is_qwen35()) {
+        /* Bonsai's template puts the effort in a ChatML system turn, and only
+         * when the level has an instruction (medium renders none); the
+         * DeepSeek max-effort text below is not part of that template. */
+        const char *effort = ds4_qwen4_reasoning_effort_text(think_mode);
+        if (effort) {
+            token_vec_push(out, vocab->im_start_id);
+            bpe_tokenize_text(vocab, "system\n", out);
+            bpe_tokenize_text(vocab, effort, out);
+            token_vec_push(out, vocab->im_end_id);
+            bpe_tokenize_text(vocab, "\n", out);
+        }
     } else if (think_mode == DS4_THINK_MAX) {
         bpe_tokenize_text(vocab, DS4_REASONING_EFFORT_MAX_PREFIX, out);
     }
 }
 
-/* Qwen3.8 ChatML.  Thinking on renders the template's reasoning instruction
- * for the effort level (xhigh by default, low, none for medium) into the
- * system turn and opens <think>; thinking off closes an empty think block, as
- * the reference template does. */
-static const char *DS4_QWEN4_REASONING_XHIGH =
+/* ChatML with a reasoning system turn: the template both Qwen3.8 and Bonsai
+ * (qwen35) ship in tokenizer.chat_template (the reference model code is
+ * src/models/qwen35.cpp in the Prism fork).  Thinking on renders the
+ * template's reasoning instruction for the effort level (xhigh by default,
+ * low, nothing for medium) into the system turn and opens <think>; thinking
+ * off closes an empty think block, as the reference template does.  Roles are
+ * plain text between <|im_start|> and <|im_end|>, so the vocabulary binds no
+ * role tokens and prepends no BOS. */
+static const char *DS4_CHATML_REASONING_XHIGH =
     "Reasoning effort is set to xhigh. Please think carefully through the task, "
     "validate key assumptions, consider plausible alternatives, and prioritize "
     "correctness, consistency, and clarity in the final answer.";
-static const char *DS4_QWEN4_REASONING_LOW =
+static const char *DS4_CHATML_REASONING_LOW =
     "Reasoning effort is set to low. Keep your thinking brief and focused, "
     "moving directly to the conclusion without unnecessary elaboration.";
 
-static void qwen4_chat_open(const ds4_vocab *vocab, const char *role, token_vec *out) {
+static void chatml_chat_open(const ds4_vocab *vocab, const char *role, token_vec *out) {
     token_vec_push(out, vocab->im_start_id);
     bpe_tokenize_text(vocab, role, out);
     bpe_tokenize_text(vocab, "\n", out);
 }
 
-static void qwen4_chat_close(const ds4_vocab *vocab, token_vec *out) {
+static void chatml_chat_close(const ds4_vocab *vocab, token_vec *out) {
     token_vec_push(out, vocab->im_end_id);
     bpe_tokenize_text(vocab, "\n", out);
 }
 
-static void qwen4_chat_assistant_prefix(const ds4_vocab *vocab, ds4_think_mode think_mode, token_vec *out) {
-    qwen4_chat_open(vocab, "assistant", out);
+static void chatml_assistant_prefix(const ds4_vocab *vocab, ds4_think_mode think_mode, token_vec *out) {
+    chatml_chat_open(vocab, "assistant", out);
     token_vec_push(out, vocab->think_start_id);
     if (ds4_think_mode_enabled(think_mode)) {
         bpe_tokenize_text(vocab, "\n", out);
@@ -43994,17 +44013,17 @@ static void qwen4_chat_assistant_prefix(const ds4_vocab *vocab, ds4_think_mode t
     }
 }
 
-static void qwen4_chat_system(const ds4_vocab *vocab, const char *system, ds4_think_mode think_mode, token_vec *out) {
+static void chatml_system(const ds4_vocab *vocab, const char *system, ds4_think_mode think_mode, token_vec *out) {
     const char *instruction = ds4_qwen4_reasoning_effort_text(think_mode);
     const bool have_system = system && system[0];
     if (!instruction && !have_system) return;
-    qwen4_chat_open(vocab, "system", out);
+    chatml_chat_open(vocab, "system", out);
     if (instruction) {
         bpe_tokenize_text(vocab, instruction, out);
         if (have_system) bpe_tokenize_text(vocab, "\n\n", out);
     }
     if (have_system) bpe_tokenize_text(vocab, system, out);
-    qwen4_chat_close(vocab, out);
+    chatml_chat_close(vocab, out);
 }
 
 static void encode_chat_prompt(
@@ -44013,16 +44032,16 @@ static void encode_chat_prompt(
         const char      *prompt,
         ds4_think_mode   think_mode,
         token_vec       *out) {
-    if (ds4_model_is_qwen4()) {
+    if (ds4_model_is_qwen4() || ds4_model_is_qwen35()) {
         if (vocab->im_start_id < 0 || vocab->im_end_id < 0 ||
             vocab->think_start_id < 0 || vocab->think_end_id < 0) {
             ds4_die("this tokenizer does not provide the Qwen chat markers; use raw prompt tokenization");
         }
-        qwen4_chat_system(vocab, system, think_mode, out);
-        qwen4_chat_open(vocab, "user", out);
+        chatml_system(vocab, system, think_mode, out);
+        chatml_chat_open(vocab, "user", out);
         bpe_tokenize_text(vocab, prompt, out);
-        qwen4_chat_close(vocab, out);
-        qwen4_chat_assistant_prefix(vocab, think_mode, out);
+        chatml_chat_close(vocab, out);
+        chatml_assistant_prefix(vocab, think_mode, out);
         return;
     }
     const bool need_think_start =
@@ -44210,23 +44229,23 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
     if (!role) role = "user";
     if (!content) content = "";
 
-    if (ds4_model_is_qwen4()) {
+    if (ds4_model_is_qwen4() || ds4_model_is_qwen35()) {
         if (!strcmp(role, "tool") || !strcmp(role, "function")) {
-            qwen4_chat_open(vocab, "user", tokens);
+            chatml_chat_open(vocab, "user", tokens);
             bpe_tokenize_text(vocab, "<tool_response>\n", tokens);
             bpe_tokenize_tool_response_text(vocab, content, tokens);
             bpe_tokenize_text(vocab, "\n</tool_response>", tokens);
         } else {
             const char *name = (!strcmp(role, "system") || !strcmp(role, "developer")) ? "system" :
                                !strcmp(role, "assistant") ? "assistant" : "user";
-            qwen4_chat_open(vocab, name, tokens);
+            chatml_chat_open(vocab, name, tokens);
             if (!strcmp(name, "assistant")) {
                 tokenize_rendered_chat_vocab(vocab, content, tokens);
             } else {
                 bpe_tokenize_text(vocab, content, tokens);
             }
         }
-        qwen4_chat_close(vocab, tokens);
+        chatml_chat_close(vocab, tokens);
         return;
     }
 
@@ -44276,8 +44295,8 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
 }
 
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode) {
-    if (ds4_model_is_qwen4()) {
-        qwen4_chat_assistant_prefix(&e->vocab, think_mode, tokens);
+    if (ds4_model_is_qwen4() || ds4_model_is_qwen35()) {
+        chatml_assistant_prefix(&e->vocab, think_mode, tokens);
         return;
     }
     token_vec_push(tokens, e->vocab.assistant_id);
@@ -73621,12 +73640,18 @@ bool ds4_engine_is_qwen4(ds4_engine *e) {
     return ds4_model_is_qwen4();
 }
 
-/* The official template's default effort is xhigh; medium adds no text. */
+bool ds4_engine_is_qwen35(ds4_engine *e) {
+    (void)e;
+    return ds4_model_is_qwen35();
+}
+
+/* The ChatML template's default effort is xhigh; medium adds no text.  Shared
+ * by the two families that render that template (Qwen3.8 and Bonsai). */
 const char *ds4_qwen4_reasoning_effort_text(ds4_think_mode mode) {
     switch (mode) {
     case DS4_THINK_HIGH:
-    case DS4_THINK_MAX:  return DS4_QWEN4_REASONING_XHIGH;
-    case DS4_THINK_LOW:  return DS4_QWEN4_REASONING_LOW;
+    case DS4_THINK_MAX:  return DS4_CHATML_REASONING_XHIGH;
+    case DS4_THINK_LOW:  return DS4_CHATML_REASONING_LOW;
     case DS4_THINK_MEDIUM: return NULL;   /* the template sets no instruction for medium */
     case DS4_THINK_NONE: return NULL;
     }
@@ -73899,7 +73924,7 @@ int ds4_chat_append_multimodal_message(
     }
     const bool tool = !strcmp(role, "tool") || !strcmp(role, "function");
     const bool user = !strcmp(role, "user");
-    if (ds4_model_is_qwen4()) {
+    if (ds4_model_is_qwen4() || ds4_model_is_qwen35()) {
         if (!tool && !user) {
             if (error && error_cap)
                 snprintf(error, error_cap, "multimodal messages require a user or tool role");
@@ -73913,7 +73938,7 @@ int ds4_chat_append_multimodal_message(
         }
         const int old_len = tokens->len;
         ds4_vocab *vocab = &e->vocab;
-        qwen4_chat_open(vocab, "user", tokens);
+        chatml_chat_open(vocab, "user", tokens);
         if (tool) bpe_tokenize_text(vocab, "<tool_response>\n", tokens);
         size_t moved = 0;
         for (size_t i = 0; i <= image_count; i++) {
@@ -73932,7 +73957,7 @@ int ds4_chat_append_multimodal_message(
             moved++;
         }
         if (tool) bpe_tokenize_text(vocab, "\n</tool_response>", tokens);
-        qwen4_chat_close(vocab, tokens);
+        chatml_chat_close(vocab, tokens);
         return 1;
     }
     if (!tool && !user) {
