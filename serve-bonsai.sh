@@ -254,7 +254,13 @@ cmd_models() {
 cmd_url() {
   say "base_url:  http://$HOST:$PORT/v1"
   say "model id:  $SERVED_ID"
-  say "open-grok: open-grok -m $TAG      (after ./serve-bonsai.sh install)"
+  local registered=0
+  [ -f "$CONFIG" ] && grep -qE "^\[model\.(\"$TAG\"|$TAG)\]" "$CONFIG" && registered=1
+  if [ "$registered" -eq 1 ]; then
+    say "open-grok: open-grok -m $TAG      (registered in $CONFIG)"
+  else
+    say "open-grok: open-grok -m $TAG      (run ./serve-bonsai.sh install once first)"
+  fi
   say "           or inside a session:  /model $TAG"
 }
 
