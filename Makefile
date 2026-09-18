@@ -1047,6 +1047,20 @@ pq2-0-test: tests/test_pq2_0.c
 	$(CC) -O2 -Wall -Wextra -std=c99 -o tests/test_pq2_0 tests/test_pq2_0.c -lm
 	./tests/test_pq2_0
 
+# Bonsai (qwen35) reference checks.  They need the Prism Bonsai GGUF and a
+# working `ds4` binary (make cuda-generic, or make on macOS); nothing here
+# calls llama.cpp.  DS4_BONSAI_MODEL overrides the default path, and
+# DS4_BONSAI_STEPS the number of greedy tokens the reference decodes.
+DS4_BONSAI_MODEL ?= /data/models/Ternary-Bonsai-2-27B-PQ2_0.gguf
+DS4_BONSAI_STEPS ?= 12
+
+.PHONY: bonsai-fold-selftest bonsai-ref-check
+bonsai-fold-selftest:
+	DS4_QWEN35_FOLD_SELFTEST=1 ./ds4 -m "$(DS4_BONSAI_MODEL)" --cpu --first-token-test --raw -p "x" | grep "fold selftest"
+
+bonsai-ref-check:
+	DS4_QWEN35_STEPS=$(DS4_BONSAI_STEPS) ./ds4 -m "$(DS4_BONSAI_MODEL)" --cpu --first-token-test --raw -p "The capital of France is" | grep -E "^token|next-token"
+
 .PHONY: test-download-model
 test-download-model:
 	python3 tests/test_model_download.py
