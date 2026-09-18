@@ -33,6 +33,10 @@ extern "C" int ds4_test_pq2_0_ref_row(const void *blocks, uint64_t row,
 extern "C" int ds4_test_pq2_0_ref_matvec(const void *blocks, uint64_t out_dim,
                                          uint64_t in_dim, const float *x,
                                          float *out);
+extern "C" int ds4_test_hadamard_fold(int op, uint32_t block_size, float *x,
+                                      uint32_t n, const float *signs,
+                                      uint32_t hd, uint32_t nk, uint32_t rep,
+                                      float *scratch);
 
 namespace {
 
@@ -419,6 +423,176 @@ bool test_shape_guards() {
     return ok;
 }
 
+/* 4. Folded activation transform.  Three oracles, each catching a different
+ * mistake: the explicit normalized Sylvester matrix (the fold selftest's own
+ * comparison, which depends on no ds4 code), the reference ds4_hadamard_*
+ * functions through their test hook, and the forward/inverse round trip.  The
+ * gdn reorder goes through the same hook's permute-then-forward path. */
+
+/* (row, col) of the normalized Sylvester Hadamard matrix. */
+static float hadamard_entry(uint32_t row, uint32_t col, uint32_t n) {
+    const uint32_t parity = (uint32_t)__builtin_popcount(row & col) & 1u;
+    return (parity ? -1.0f : 1.0f) / std::sqrt((float)n);
+}
+
+struct fold_case {
+    const char *name;
+    uint32_t    n;
+    uint32_t    n_tok;
+    int         op;        /* 0 rotate, 1 forward, 2 inverse, 3 gdn reorder + forward */
+    bool        use_signs;
+};
+
+/* Runs one fold op on the device and against the reference. */
+static bool compare_fold(const fold_case &c, uint32_t bs, uint32_t hd,
+                         uint32_t nk, uint32_t rep,
+                         const std::vector<float> &signs,
+                         const std::vector<float> &x0, ds4_gpu_tensor *gx,
+                         ds4_gpu_tensor *gs) {
+    const uint64_t count = (uint64_t)c.n * c.n_tok;
+    std::vector<float> ref = x0, got(count), scratch(c.n);
+    const float *sr = c.use_signs ? signs.data() : nullptr;
+
+    /* The reference hook works on one row; the kernel covers n_tok rows. */
+    for (uint32_t t = 0; t < c.n_tok; t++) {
+        if (ds4_test_hadamard_fold(c.op, bs, ref.data() + (size_t)t * c.n, c.n,
+                                   sr, hd, nk, rep, scratch.data()) != 0) {
+            std::fprintf(stderr, "fold %s: reference failed\n", c.name);
+            return false;
+        }
+    }
+
+    bool ran = ds4_gpu_tensor_write(gx, 0, x0.data(), count * sizeof(float));
+    if (ran) {
+        switch (c.op) {
+        case 0:   /* bare rotation: the inverse entry with no signs */
+            ran = ds4_gpu_qwen35_fold_inverse_tensor(gx, c.n, c.n_tok, bs,
+                                                     nullptr) != 0;
+            break;
+        case 1:
+            ran = ds4_gpu_qwen35_fold_forward_tensor(gx, c.n, c.n_tok, bs, gs,
+                                                     0u, 0u, 0u, 0u) != 0;
+            break;
+        case 2:
+            ran = ds4_gpu_qwen35_fold_inverse_tensor(gx, c.n, c.n_tok, bs,
+                                                     gs) != 0;
+            break;
+        default:
+            ran = ds4_gpu_qwen35_fold_forward_tensor(gx, c.n, c.n_tok, bs, gs,
+                                                     1u, hd, nk, rep) != 0;
+            break;
+        }
+    }
+    ran = ran && ds4_gpu_tensor_read(gx, 0, got.data(), count * sizeof(float));
+    if (!ran) {
+        std::fprintf(stderr, "fold %s: CUDA run failed\n", c.name);
+        return false;
+    }
+    return close_enough(got, ref, 1e-4f, 1e-4f, c.name);
+}
+
+static bool test_fold_transform() {
+    /* The model's folded input widths, plus the single-block case. */
+    struct width { uint32_t n; uint32_t n_tok; };
+    const width widths[] = {
+        { 5120, 1}, { 5120, 5}, { 6144, 4}, {17408, 2}, { 1024, 1},
+    };
+    constexpr uint32_t bs = 1024;                    /* prism.hadamard block */
+    constexpr uint32_t hd = 128, nk = 16, rep = 3;   /* gdn v-grouped geometry */
+
+    bool ok = true;
+    for (const width &w : widths) {
+        const uint32_t n = w.n;
+        const uint32_t n_tok = w.n_tok;
+        const uint64_t count = (uint64_t)n * n_tok;
+
+        std::vector<float> signs(n);
+        for (uint32_t i = 0; i < n; i++) {
+            signs[i] = ((i * 7u) % 3u == 0u) ? -1.0f : 1.0f;
+        }
+        std::vector<float> x0(count);
+        for (uint64_t i = 0; i < count; i++) {
+            x0[i] = std::sin((float)i * 0.7f) + 0.3f * std::cos((float)i * 1.3f);
+        }
+
+        ds4_gpu_tensor *gx = ds4_gpu_tensor_alloc(count * sizeof(float));
+        ds4_gpu_tensor *gs = ds4_gpu_tensor_alloc((uint64_t)n * sizeof(float));
+        if (!gx || !gs ||
+            !ds4_gpu_tensor_write(gs, 0, signs.data(), n * sizeof(float))) {
+            std::fprintf(stderr, "fold n=%u: tensor setup failed\n", n);
+            ds4_gpu_tensor_free(gx);
+            ds4_gpu_tensor_free(gs);
+            return false;
+        }
+
+        const fold_case cases[] = {
+            {"fold rotate",  n, n_tok, 0, false},
+            {"fold forward", n, n_tok, 1, true},
+            {"fold inverse", n, n_tok, 2, true},
+        };
+        for (const fold_case &c : cases) {
+            ok = compare_fold(c, bs, hd, nk, rep, signs, x0, gx, gs) && ok;
+        }
+        /* The gdn reorder only exists where the head geometry tiles the row. */
+        if ((uint64_t)hd * nk * rep == n) {
+            const fold_case gdn_case = {"fold gdn reorder + forward", n, n_tok, 3, true};
+            ok = compare_fold(gdn_case, bs, hd, nk, rep, signs, x0, gx, gs) && ok;
+        }
+
+        /* Round trip: the inverse must undo the forward exactly enough that a
+         * second forward reproduces the first (the transform's H*H = I). */
+        {
+            std::vector<float> once(count), twice(count);
+            bool ran = ds4_gpu_tensor_write(gx, 0, x0.data(), count * sizeof(float)) &&
+                ds4_gpu_qwen35_fold_forward_tensor(gx, n, n_tok, bs, gs, 0u, 0u, 0u, 0u) &&
+                ds4_gpu_tensor_read(gx, 0, once.data(), count * sizeof(float)) &&
+                ds4_gpu_qwen35_fold_forward_tensor(gx, n, n_tok, bs, gs, 0u, 0u, 0u, 0u) &&
+                ds4_gpu_qwen35_fold_inverse_tensor(gx, n, n_tok, bs, gs) &&
+                ds4_gpu_qwen35_fold_inverse_tensor(gx, n, n_tok, bs, gs) &&
+                ds4_gpu_tensor_read(gx, 0, twice.data(), count * sizeof(float));
+            if (!ran) {
+                std::fprintf(stderr, "fold n=%u: round trip run failed\n", n);
+                ok = false;
+            } else {
+                char label[160];
+                std::snprintf(label, sizeof(label),
+                              "fold forward/inverse round trip n=%u rows=%u",
+                              n, n_tok);
+                ok = close_enough(twice, x0, 1e-3f, 1e-3f, label) && ok;
+            }
+        }
+
+        /* Explicit Sylvester matrix on one block: the fold selftest's oracle,
+         * which depends on none of ds4's transform code. */
+        if (n == bs) {
+            std::vector<float> want(n), got(n);
+            for (uint32_t row = 0; row < n; row++) {
+                double acc = 0.0;
+                for (uint32_t col = 0; col < n; col++) {
+                    acc += (double)hadamard_entry(row, col, n) * (double)x0[col];
+                }
+                want[row] = (float)acc;
+            }
+            const bool ran =
+                ds4_gpu_tensor_write(gx, 0, x0.data(), count * sizeof(float)) &&
+                ds4_gpu_qwen35_fold_forward_tensor(gx, n, n_tok, bs, nullptr,
+                                                   0u, 0u, 0u, 0u) &&
+                ds4_gpu_tensor_read(gx, 0, got.data(), count * sizeof(float));
+            if (!ran) {
+                std::fprintf(stderr, "fold n=%u: explicit-matrix run failed\n", n);
+                ok = false;
+            } else {
+                ok = close_enough(got, want, 1e-4f, 1e-4f,
+                                  "fold vs explicit Hadamard matrix n=1024") && ok;
+            }
+        }
+
+        ds4_gpu_tensor_free(gx);
+        ds4_gpu_tensor_free(gs);
+    }
+    return ok;
+}
+
 /* 3. Host wiring: the entries the qwen35 CUDA graph will call
  * (ds4_gpu_embed_token(s)_quant_tensor and ds4_gpu_matmul_quant_tensor) must
  * resolve a PQ2_0 weight out of the model map and dispatch to the kernels
@@ -575,6 +749,7 @@ int main() {
     const bool rows_ok = test_row_lookup();
     const bool guards_ok = test_shape_guards();
     const bool host_ok = test_host_wiring();
+    const bool fold_ok = test_fold_transform();
 
     /* Random activations: the kernels quantize the activation to the Q8_1
      * form, so the outputs are compared by relative L2 error against the
@@ -598,7 +773,7 @@ int main() {
     }
     exact_ok = run_shape(kShapes[0], 64, "exact64", true) && exact_ok;
 
-    const bool ok = rows_ok && guards_ok && host_ok && shapes_ok && exact_ok;
+    const bool ok = rows_ok && guards_ok && host_ok && fold_ok && shapes_ok && exact_ok;
     std::fprintf(stderr, "PQ2_0 CUDA parity: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }

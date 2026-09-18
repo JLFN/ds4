@@ -71499,6 +71499,45 @@ int ds4_test_pq2_0_ref_matvec(const void *blocks, uint64_t out_dim,
     free(row);
     return 0;
 }
+
+/* Reference entry point for the folded activation transform, so the CUDA
+ * parity test drives ds4_hadamard_* itself.  op selects the operation the
+ * caller wants measured: 0 rotate, 1 forward, 2 inverse, 3 gdn reorder then
+ * forward (the ssm_out input).  block_size temporarily sets the transform's
+ * block, which the loader would otherwise take from the GGUF. */
+int ds4_test_hadamard_fold(int op, uint32_t block_size, float *x, uint32_t n,
+                           const float *signs, uint32_t hd, uint32_t nk,
+                           uint32_t rep, float *scratch) {
+    if (!x || n == 0 || block_size == 0) return 1;
+    const uint32_t saved = g_hadamard.block_size;
+    g_hadamard.block_size = block_size;
+    int rc = 0;
+    switch (op) {
+    case 0:
+        ds4_hadamard_rotate(x, n);
+        break;
+    case 1:
+        ds4_hadamard_forward(x, n, signs);
+        break;
+    case 2:
+        ds4_hadamard_inverse(x, n, signs);
+        break;
+    case 3:
+        if (hd == 0 || nk == 0 || rep == 0 ||
+            (uint64_t)hd * nk * rep != n || !scratch) {
+            rc = 1;
+            break;
+        }
+        ds4_hadamard_gdn_permute(x, hd, nk, rep, scratch);
+        ds4_hadamard_forward(x, n, signs);
+        break;
+    default:
+        rc = 1;
+        break;
+    }
+    g_hadamard.block_size = saved;
+    return rc;
+}
 #endif /* DS4_TEST_HOOKS */
 
 static int engine_install_dspark_support_cache(ds4_engine *e);

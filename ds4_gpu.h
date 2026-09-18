@@ -3540,6 +3540,23 @@ int ds4_gpu_qwen4_mtp_stage_tensor(
 int ds4_gpu_qwen4_mtp_combine_tensor(
         ds4_gpu_tensor *R_out, const ds4_gpu_tensor *proj, uint32_t n_embd, uint32_t n_hc);
 
+/* Prism Bonsai (qwen35/PQ2_0).  The folded-weight activation transform: every
+ * matmul weight is stored in the rotated basis, so the runtime rotates the
+ * activation instead.  block_size is the prism.hadamard block (1024 in this
+ * file) and signs the sign vector of the weight's input width (NULL applies
+ * none); both transforms are in place over n_tok rows of n values, and n must
+ * be a whole number of block_size blocks.  The forward fold of the gdn output
+ * projection (gdn = 1) reorders the row from the tiled [hd][nk][rep] head
+ * order to the grouped [hd][rep][nk] order first. */
+int ds4_gpu_qwen35_fold_forward_tensor(
+        ds4_gpu_tensor *x, uint32_t n, uint32_t n_tok, uint32_t block_size,
+        const ds4_gpu_tensor *signs, uint32_t gdn, uint32_t hd, uint32_t nk,
+        uint32_t rep);
+/* token-embedding lookups store the row already rotated: x = signs * H(z) */
+int ds4_gpu_qwen35_fold_inverse_tensor(
+        ds4_gpu_tensor *x, uint32_t n, uint32_t n_tok, uint32_t block_size,
+        const ds4_gpu_tensor *signs);
+
 #ifdef __cplusplus
 }
 #endif
