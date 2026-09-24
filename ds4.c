@@ -68774,10 +68774,26 @@ static int qwen35_hadamard_selftest(void) {
     return failures == 0 ? 0 : 1;
 }
 
-/* Tokens per graph call.  The diagnostic drives one token at a time, which is
- * what the reference does; a batched prefill pass needs the logits buffer
- * sized for the batch, so it stays small for now. */
-#define DS4_QWEN35_MAX_BATCH 8u
+/* Tokens per graph call.  The session prefill hands the graph a chunk of the
+ * prompt instead of one token, so every transient tensor is sized for the
+ * chunk capacity the session can afford: qwen35_graph_open takes it as
+ * cap_tokens and the session shrinks it (halving) until the arena allocates.
+ * DS4_QWEN35_PREFILL_CHUNK overrides the default, clamped to MAX.  The
+ * diagnostic still drives one token at a time, which is what the reference
+ * does. */
+#define DS4_QWEN35_DEFAULT_CHUNK 512u
+#define DS4_QWEN35_MAX_CHUNK     1024u
+
+/* Chunk size a Bonsai prefill pass asks for, before the session checks it
+ * against the context and against what the arena actually allocates. */
+static uint32_t qwen35_prefill_chunk_tokens(uint32_t ctx) {
+    const char *env = getenv("DS4_QWEN35_PREFILL_CHUNK");
+    const unsigned long v = env && env[0] ? strtoul(env, NULL, 10)
+                                          : DS4_QWEN35_DEFAULT_CHUNK;
+    uint32_t chunk = v == 0 || v > DS4_QWEN35_MAX_CHUNK ? DS4_QWEN35_DEFAULT_CHUNK
+                                                        : (uint32_t)v;
+    return chunk > ctx ? ctx : chunk;
+}
 
 /* ------------------------------------------------------------------------
  * Bonsai (qwen35) CUDA graph.
@@ -68797,6 +68813,7 @@ static int qwen35_hadamard_selftest(void) {
 
 typedef struct ds4_qwen35_gpu_graph {
     uint32_t ctx_cap;
+    uint32_t cap_tokens;
     uint32_t pos;
     bool     owns_scratch;
     ds4_gpu_tensor *h, *normed, *blk, *xt, *qkv, *z, *ga, *gb, *lin_o;
@@ -68941,6 +68958,30 @@ static bool qwen35_graph_linear(ds4_qwen35_gpu_graph *g, const ds4_model *m,
     return qwen35_graph_gemv_folded(g, g->blk, m, l->lin_out, g->lin_o, T, true);
 }
 
+/* The Bonsai attention core runs a chunk in row batches of at most this many
+ * rows.  Two reasons, both load-bearing:
+ *
+ *  - The row-exact kernel (the qwen4 `attention` template with a single split)
+ *    computes each row's softmax over keys 0..pos0+t, the same accumulation
+ *    the one-token path performs at that position, so each row sees exactly
+ *    the keys and the same reduction order decode would use.  The token-tile
+ *    fast path (attention_group, selected at T >= 32) accumulates the same sum
+ *    differently AND, measured 2026-09-24, faults with an illegal
+ *    shared-memory access at this geometry (H/Hkv = 6, D = 256) inside its
+ *    first B-tile ldmatrix - a latent defect of that kernel, reachable here
+ *    for the first time because Bonsai had no T >= 32 caller before chunked
+ *    prefill.  It must not be selected until it is fixed and verified.
+ *  - At T <= 16 the dispatcher cannot select that path at all, so nothing here
+ *    depends on the gate in ds4_gpu_qwen4_attn_decode_tensor.
+ *
+ * The rows of a batched pass are not bit-identical to a per-token pass, and
+ * not because of this kernel: the projections around it accumulate over N
+ * columns with tiling that depends on N, so logits drift in the fourth decimal
+ * while the argmax and the generated ids stay identical (measured across chunk
+ * sizes 1..64: same token stream, top-logit values differing in the 4th
+ * decimal; and the CPU reference agrees with the GPU on the ids). */
+#define DS4_QWEN35_ATTN_ROWS 16u
+
 static bool qwen35_graph_attention(ds4_qwen35_gpu_graph *g, const ds4_model *m,
                                    const ds4_layer_weights *l, uint32_t il,
                                    const ds4_gpu_tensor *x, uint32_t pos0, uint32_t T) {
@@ -68961,11 +69002,28 @@ static bool qwen35_graph_attention(ds4_qwen35_gpu_graph *g, const ds4_model *m,
         return false;
     }
     /* The sigmoid gate rides inside the attention kernel (attn_prep kept the
-     * raw second half of the q projection). */
-    if (!ds4_gpu_qwen4_attn_decode_tensor(g->o, g->q, g->gate, g->k_cache[il],
-                                          g->v_cache[il], NULL, NULL, NULL, T, H, Hkv, D,
-                                          pos0, false, 0u, 1.0f / sqrtf((float)D))) {
-        return false;
+     * raw second half of the q projection).  Rows are handed over in batches
+     * of DS4_QWEN35_ATTN_ROWS; each batch is the same kernel the one-token
+     * path uses, at the rows' own positions. */
+    const uint32_t q_dim = H * D;
+    for (uint32_t r0 = 0; r0 < T; r0 += DS4_QWEN35_ATTN_ROWS) {
+        const uint32_t rt = T - r0 < DS4_QWEN35_ATTN_ROWS ? T - r0 : DS4_QWEN35_ATTN_ROWS;
+        ds4_gpu_tensor *q = r0 ? ds4_gpu_tensor_view(g->q, (uint64_t)r0 * q_dim * sizeof(float),
+                                                     (uint64_t)rt * q_dim * sizeof(float)) : g->q;
+        ds4_gpu_tensor *gate = r0 ? ds4_gpu_tensor_view(g->gate, (uint64_t)r0 * q_dim * sizeof(float),
+                                                        (uint64_t)rt * q_dim * sizeof(float)) : g->gate;
+        ds4_gpu_tensor *o = r0 ? ds4_gpu_tensor_view(g->o, (uint64_t)r0 * q_dim * sizeof(float),
+                                                     (uint64_t)rt * q_dim * sizeof(float)) : g->o;
+        const bool ok = q && gate && o &&
+            ds4_gpu_qwen4_attn_decode_tensor(o, q, gate, g->k_cache[il], g->v_cache[il],
+                                             NULL, NULL, NULL, rt, H, Hkv, D,
+                                             pos0 + r0, false, 0u, 1.0f / sqrtf((float)D));
+        if (r0) {
+            ds4_gpu_tensor_free(q);
+            ds4_gpu_tensor_free(gate);
+            ds4_gpu_tensor_free(o);
+        }
+        if (!ok) return false;
     }
     return qwen35_graph_gemv_folded(g, g->blk, m, l->attn_output, g->o, T, false);
 }
@@ -69024,11 +69082,14 @@ static void qwen35_graph_free(ds4_qwen35_gpu_graph *g) {
 
 /* One allocation per tensor the trunk reuses, plus the per-layer state: a
  * gated delta-net layer keeps its state and conv history, an attention layer
- * its fp16 k/v cache.  The x scratch is sized for the widest matmul input
- * (the dense FFN's 17408). */
-static bool qwen35_graph_open(ds4_qwen35_gpu_graph *g, ds4_engine *e, uint32_t ctx_cap) {
+ * its fp16 k/v cache.  The transients are sized for cap_tokens rows so one
+ * call can carry a whole prefill chunk; the x scratch is sized for the widest
+ * matmul input (the dense FFN's 17408).  The logits stay one row wide (see
+ * qwen35_graph_forward: only the last row of a chunk is projected). */
+static bool qwen35_graph_open(ds4_qwen35_gpu_graph *g, ds4_engine *e, uint32_t ctx_cap,
+                              uint32_t cap_tokens) {
     const ds4_weights *w = &e->weights;
-    const uint32_t E = DS4_N_EMBD, T = 1;
+    const uint32_t E = DS4_N_EMBD, T = cap_tokens ? cap_tokens : 1u;
     const uint32_t F = DS4_N_FF_DENSE, D = DS4_N_LIN_HEAD_DIM;
     const uint32_t Hv = DS4_N_LIN_V_HEAD;
     const uint64_t f32 = sizeof(float);
@@ -69039,6 +69100,7 @@ static bool qwen35_graph_open(ds4_qwen35_gpu_graph *g, ds4_engine *e, uint32_t c
 
     memset(g, 0, sizeof(*g));
     g->ctx_cap = ctx_cap;
+    g->cap_tokens = T;
     g->owns_scratch = true;
 
     g->h      = ds4_gpu_tensor_alloc((uint64_t)T * E * f32);
@@ -69058,8 +69120,8 @@ static bool qwen35_graph_open(ds4_qwen35_gpu_graph *g, ds4_engine *e, uint32_t c
     g->o      = ds4_gpu_tensor_alloc((uint64_t)T * DS4_N_HEAD * DS4_N_HEAD_DIM * f32);
     g->ffn_g  = ds4_gpu_tensor_alloc((uint64_t)T * F * f32);
     g->ffn_u  = ds4_gpu_tensor_alloc((uint64_t)T * F * f32);
-    g->logits = ds4_gpu_tensor_alloc((uint64_t)T * DS4_N_VOCAB * f32);
-    g->tokens = ds4_gpu_tensor_alloc((uint64_t)DS4_QWEN35_MAX_BATCH * sizeof(uint32_t));
+    g->logits = ds4_gpu_tensor_alloc((uint64_t)DS4_N_VOCAB * f32);
+    g->tokens = ds4_gpu_tensor_alloc((uint64_t)T * sizeof(uint32_t));
     g->pos3   = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * 4 * sizeof(uint32_t));
 
     bool ok = g->h && g->normed && g->blk && g->xt && g->qkv && g->z &&
@@ -69118,14 +69180,20 @@ static void qwen35_graph_reset(ds4_qwen35_gpu_graph *g) {
     g->pos = 0;
 }
 
-/* T tokens at consecutive positions starting at g->pos.  The token ids are
- * uploaded so the embedding lookup reads the table on the device. */
+/* T tokens at consecutive positions starting at g->pos, T up to the arena's
+ * cap_tokens.  The chunk is causal by construction: every recurrent kernel
+ * (conv, gdn prep/scan) walks t in order, and the attention prep writes the
+ * chunk's k/v rows at pos0+t before the attention kernel reads them, whose
+ * per-row mask is p <= pos0+t - exactly one more visible key per row, the
+ * same accumulation the one-token path performs at each of those positions.
+ * The token ids are uploaded so the embedding lookup reads the table on the
+ * device. */
 static bool qwen35_graph_forward(ds4_qwen35_gpu_graph *g, ds4_engine *e,
                                  const int *tokens, uint32_t T, float *logits_out) {
     const ds4_model *m = &e->model;
     const ds4_weights *w = &e->weights;
-    uint32_t ids[DS4_QWEN35_MAX_BATCH];
-    if (!g || T == 0 || T > DS4_QWEN35_MAX_BATCH) return false;
+    uint32_t ids[DS4_QWEN35_MAX_CHUNK];
+    if (!g || T == 0 || T > g->cap_tokens) return false;
     if (g->pos + T > g->ctx_cap) {
         fprintf(stderr, "ds4: Bonsai CUDA graph: context of %u tokens is full\n", g->ctx_cap);
         return false;
@@ -69160,13 +69228,27 @@ static bool qwen35_graph_forward(ds4_qwen35_gpu_graph *g, ds4_engine *e,
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         ok = qwen35_graph_layer(g, m, w, il, pos0, T);
     }
+    /* Only the last row of a chunk feeds the next step, so the final norm, the
+     * fold and the output projection run on that row alone: a logits row is
+     * one full vocabulary wide (248320 floats, 1 MiB) and the output
+     * projection is the widest matmul in the graph, so projecting rows nobody
+     * reads would cost real memory (508 MiB at a 512-token chunk) and real
+     * time. */
     if (ok && logits_out) {
-        ok = qwen35_graph_norm(g, g->normed, m, w->output_norm, g->h, T) &&
-             qwen35_graph_fold(g, g->normed, DS4_N_EMBD, T, false) &&
-             qwen35_graph_gemv(g->logits, m, w->output, g->normed, T);
+        ds4_gpu_tensor *last = T > 1u
+            ? ds4_gpu_tensor_view(g->h, (uint64_t)(T - 1u) * DS4_N_EMBD * sizeof(float),
+                                  (uint64_t)DS4_N_EMBD * sizeof(float))
+            : g->h;
+        ok = last != NULL;
         if (ok) {
-            ok = ds4_gpu_tensor_read(g->logits, (uint64_t)(T - 1) * DS4_N_VOCAB * sizeof(float),
-                                     logits_out, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+            ok = qwen35_graph_norm(g, g->normed, m, w->output_norm, last, 1u) &&
+                 qwen35_graph_fold(g, g->normed, DS4_N_EMBD, 1u, false) &&
+                 qwen35_graph_gemv(g->logits, m, w->output, g->normed, 1u);
+        }
+        if (T > 1u) ds4_gpu_tensor_free(last);
+        if (ok) {
+            ok = ds4_gpu_tensor_read(g->logits, 0, logits_out,
+                                     (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
         }
     }
     if (!ds4_gpu_flush_commands()) ok = false;
@@ -69255,7 +69337,7 @@ static int qwen35_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
             return 1;
         }
     } else if (on_gpu) {
-        if (!qwen35_graph_open(&graph, e, n_seq + steps + 1u)) {
+        if (!qwen35_graph_open(&graph, e, n_seq + steps + 1u, 1u)) {
             free(logits);
             free(seq);
             return 1;
@@ -69293,7 +69375,7 @@ static int qwen35_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
         if (on_gpu) {
             ds4_qwen35_gpu_graph dg;
             memset(&dg, 0, sizeof(dg));
-            if (!qwen35_graph_open(&dg, e, n_seq + 1u)) {
+            if (!qwen35_graph_open(&dg, e, n_seq + 1u, 1u)) {
                 fprintf(stderr, "ds4: cannot open a second Bonsai CUDA graph for the dump\n");
                 free(all);
                 free(logits);
@@ -74766,11 +74848,27 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             return 1;
         }
         s->qwen35_graph = xcalloc(1, sizeof(*s->qwen35_graph));
-        if (!s->qwen35_graph || !qwen35_graph_open(s->qwen35_graph, e, (uint32_t)ctx_size)) {
+        if (!s->qwen35_graph) {
+            free(s);
+            return 1;
+        }
+        /* The arena is sized for the prefill chunk, so its cost scales with
+         * the chunk, not the context: take the requested chunk and halve it
+         * until the transients allocate (the k/v caches are sized by the
+         * context and are not negotiable).  A chunk of 1 is the old
+         * one-token-per-forward path, so this always converges. */
+        uint32_t chunk = qwen35_prefill_chunk_tokens((uint32_t)ctx_size);
+        if (e->prefill_chunk && e->prefill_chunk < chunk) chunk = e->prefill_chunk;
+        while (chunk > 0 && !qwen35_graph_open(s->qwen35_graph, e, (uint32_t)ctx_size, chunk)) {
+            chunk /= 2u;
+        }
+        if (!chunk) {
             free(s->qwen35_graph);
             free(s);
             return 1;
         }
+        fprintf(stderr, "ds4: Bonsai prefill chunk: %u tokens (ctx %d)\n",
+                s->qwen35_graph->cap_tokens, ctx_size);
         s->prefill_cap = (uint32_t)ctx_size;
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
         s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
@@ -77198,27 +77296,37 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 return 1;
             }
         }
-        /* One token per forward: the graph's transient tensors hold a single
-         * row, so a batched prefill needs the wider arena Phase F plans. */
-        for (int i = start; i < prompt->len; i++) {
-            if (g->pos >= g->ctx_cap) {
-                snprintf(err, errlen, "context is full");
-                return 1;
-            }
+        /* Chunked prefill: the arena holds prefill_chunk rows, so hand the
+         * graph as many tokens per forward as it can take.  The kernels are
+         * causal by construction (see qwen35_graph_forward), so a chunk
+         * produces the same state as the token-at-a-time loop it replaces. */
+        for (int i = start; i < prompt->len; ) {
             if (ds4_session_cancelled(s)) {
                 s->checkpoint_valid = s->checkpoint.len > 0;
                 snprintf(err, errlen, "interrupted");
                 return DS4_SESSION_SYNC_INTERRUPTED;
             }
-            if (!qwen35_graph_forward(g, e, prompt->v + i, 1u, s->logits)) {
+            if (g->pos >= g->ctx_cap) {
+                snprintf(err, errlen, "context is full");
+                return 1;
+            }
+            uint32_t chunk = (uint32_t)(prompt->len - i);
+            if (chunk > g->cap_tokens) chunk = g->cap_tokens;
+            if (chunk > g->ctx_cap - g->pos) chunk = g->ctx_cap - g->pos;
+            /* Progress callbacks may persist this frontier, and cancellation
+             * may leave it as the live session: until the chunk's state and
+             * logits are complete the checkpoint is not a valid resume point. */
+            s->checkpoint_valid = false;
+            if (!qwen35_graph_forward(g, e, prompt->v + i, chunk, s->logits)) {
                 snprintf(err, errlen, "Bonsai prefill failed at token %d", i);
                 s->checkpoint_valid = false;
                 return 1;
             }
-            token_vec_push(&s->checkpoint, prompt->v[i]);
+            for (uint32_t j = 0; j < chunk; j++) token_vec_push(&s->checkpoint, prompt->v[i + (int)j]);
+            i += (int)chunk;
             s->checkpoint_valid = true;
             s->mtp_draft_valid = false;
-            if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
+            if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i, prompt->len);
         }
         return 0;
     }

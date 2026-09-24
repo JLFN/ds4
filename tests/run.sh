@@ -45,6 +45,12 @@ if [[ -f "$MODEL" ]]; then
     step "Bonsai session path against the CPU reference (CUDA)"
     run "test-qwen35-session" make test-qwen35-session \
       DS4_TEST_MODEL="$MODEL" CUDA_ARCH="$CUDA_ARCH"
+    # The same scenarios again with a two-token prefill chunk, so the prompt
+    # crosses several chunk boundaries: chunked prefill must reach the same
+    # state and logits as the one-token-per-forward path it replaced.
+    step "Bonsai session path, multi-chunk prefill (CUDA)"
+    run "test-qwen35-session-multichunk" env DS4_QWEN35_PREFILL_CHUNK=2 \
+      make test-qwen35-session DS4_TEST_MODEL="$MODEL" CUDA_ARCH="$CUDA_ARCH"
   fi
 else
   echo
