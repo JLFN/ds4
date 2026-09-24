@@ -33272,6 +33272,21 @@ static int cuda_matmul_mmq_dense_quant(
             cuda_decode_stream());
         break;
     case 142u:
+        /* Prism PQ2_0.  The tile GEMM computes a whole 8-column tile per
+         * block, which is mostly waste for the single row a decode step
+         * projects; the vec entry is the MMVQ GEMV built for that regime (and
+         * capped at MMVQ_MAX_BATCH_SIZE columns), the same split the routed
+         * experts already use (_moe_vec at n_tokens <= 8).  An nsys capture of
+         * decode tokens has this kernel at 42.5 percent of the captured GPU
+         * time, 401 calls per token, 66 us each (the independent QA, whose
+         * capture window also contained a 64-token prefill, read 62.5 percent
+         * for the same kernel over its wider window). */
+        if (n_tok <= 8u) {
+            rc = ds4_mmq_pq2_0_dense_vec(weights, (const float *)x->ptr,
+                (float *)out->ptr, (int)out_dim, (int)n_tok, (int)in_dim,
+                cuda_decode_stream());
+            break;
+        }
         rc = ds4_mmq_pq2_0_dense(weights, (const float *)x->ptr,
             (float *)out->ptr, (int)out_dim, (int)n_tok, (int)in_dim,
             cuda_decode_stream());

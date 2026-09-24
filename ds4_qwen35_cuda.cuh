@@ -79,7 +79,11 @@ __global__ void fold_gdn_permute(float * __restrict__ dst, const float * __restr
                                  uint32_t n, uint32_t hd, uint32_t nk, uint32_t rep) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    dst[i] = src[gdn_src(i, hd, nk, rep)];
+    /* blockIdx.y is the row: a prefill chunk permutes hundreds of rows, and
+     * one launch for the whole chunk costs the same GPU work as one launch per
+     * row while removing hundreds of host launches per fold. */
+    const uint64_t off = (uint64_t) blockIdx.y * n;
+    dst[off + i] = src[off + gdn_src(i, hd, nk, rep)];
 }
 
 } // namespace
@@ -116,11 +120,8 @@ static int ds4_qwen35_fold_launch(
         float *tmp = (float *) cuda_tmp_alloc((uint64_t) n * n_tok * sizeof(float),
                                               "Bonsai gdn fold permute");
         if (!tmp) return 0;
-        for (uint32_t t = 0; t < n_tok; t++) {
-            qwen35_cuda::fold_gdn_permute<<<(n + 255u) / 256u, 256, 0, cuda_decode_stream()>>>(
-                tmp + (uint64_t) t * n, (const float *) x->ptr + (uint64_t) t * n,
-                n, hd, nk, rep);
-        }
+        qwen35_cuda::fold_gdn_permute<<<dim3((n + 255u) / 256u, n_tok), 256, 0, cuda_decode_stream()>>>(
+            tmp, (const float *) x->ptr, n, hd, nk, rep);
         src = tmp;
     }
 
