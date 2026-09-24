@@ -68958,6 +68958,30 @@ static bool qwen35_graph_linear(ds4_qwen35_gpu_graph *g, const ds4_model *m,
     return qwen35_graph_gemv_folded(g, g->blk, m, l->lin_out, g->lin_o, T, true);
 }
 
+/* The Bonsai attention core runs a chunk in row batches of at most this many
+ * rows.  Two reasons, both load-bearing:
+ *
+ *  - The row-exact kernel (the qwen4 `attention` template with a single split)
+ *    computes each row's softmax over keys 0..pos0+t, the same accumulation
+ *    the one-token path performs at that position, so each row sees exactly
+ *    the keys and the same reduction order decode would use.  The token-tile
+ *    fast path (attention_group, selected at T >= 32) accumulates the same sum
+ *    differently AND, measured 2026-09-24, faults with an illegal
+ *    shared-memory access at this geometry (H/Hkv = 6, D = 256) inside its
+ *    first B-tile ldmatrix - a latent defect of that kernel, reachable here
+ *    for the first time because Bonsai had no T >= 32 caller before chunked
+ *    prefill.  It must not be selected until it is fixed and verified.
+ *  - At T <= 16 the dispatcher cannot select that path at all, so nothing here
+ *    depends on the gate in ds4_gpu_qwen4_attn_decode_tensor.
+ *
+ * The rows of a batched pass are not bit-identical to a per-token pass, and
+ * not because of this kernel: the projections around it accumulate over N
+ * columns with tiling that depends on N, so logits drift in the fourth decimal
+ * while the argmax and the generated ids stay identical (measured across chunk
+ * sizes 1..64: same token stream, top-logit values differing in the 4th
+ * decimal; and the CPU reference agrees with the GPU on the ids). */
+#define DS4_QWEN35_ATTN_ROWS 16u
+
 static bool qwen35_graph_attention(ds4_qwen35_gpu_graph *g, const ds4_model *m,
                                    const ds4_layer_weights *l, uint32_t il,
                                    const ds4_gpu_tensor *x, uint32_t pos0, uint32_t T) {
@@ -68978,11 +69002,28 @@ static bool qwen35_graph_attention(ds4_qwen35_gpu_graph *g, const ds4_model *m,
         return false;
     }
     /* The sigmoid gate rides inside the attention kernel (attn_prep kept the
-     * raw second half of the q projection). */
-    if (!ds4_gpu_qwen4_attn_decode_tensor(g->o, g->q, g->gate, g->k_cache[il],
-                                          g->v_cache[il], NULL, NULL, NULL, T, H, Hkv, D,
-                                          pos0, false, 0u, 1.0f / sqrtf((float)D))) {
-        return false;
+     * raw second half of the q projection).  Rows are handed over in batches
+     * of DS4_QWEN35_ATTN_ROWS; each batch is the same kernel the one-token
+     * path uses, at the rows' own positions. */
+    const uint32_t q_dim = H * D;
+    for (uint32_t r0 = 0; r0 < T; r0 += DS4_QWEN35_ATTN_ROWS) {
+        const uint32_t rt = T - r0 < DS4_QWEN35_ATTN_ROWS ? T - r0 : DS4_QWEN35_ATTN_ROWS;
+        ds4_gpu_tensor *q = r0 ? ds4_gpu_tensor_view(g->q, (uint64_t)r0 * q_dim * sizeof(float),
+                                                     (uint64_t)rt * q_dim * sizeof(float)) : g->q;
+        ds4_gpu_tensor *gate = r0 ? ds4_gpu_tensor_view(g->gate, (uint64_t)r0 * q_dim * sizeof(float),
+                                                        (uint64_t)rt * q_dim * sizeof(float)) : g->gate;
+        ds4_gpu_tensor *o = r0 ? ds4_gpu_tensor_view(g->o, (uint64_t)r0 * q_dim * sizeof(float),
+                                                     (uint64_t)rt * q_dim * sizeof(float)) : g->o;
+        const bool ok = q && gate && o &&
+            ds4_gpu_qwen4_attn_decode_tensor(o, q, gate, g->k_cache[il], g->v_cache[il],
+                                             NULL, NULL, NULL, rt, H, Hkv, D,
+                                             pos0 + r0, false, 0u, 1.0f / sqrtf((float)D));
+        if (r0) {
+            ds4_gpu_tensor_free(q);
+            ds4_gpu_tensor_free(gate);
+            ds4_gpu_tensor_free(o);
+        }
+        if (!ok) return false;
     }
     return qwen35_graph_gemv_folded(g, g->blk, m, l->attn_output, g->o, T, false);
 }
