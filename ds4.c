@@ -68819,6 +68819,12 @@ typedef struct ds4_qwen35_gpu_graph {
     ds4_gpu_tensor *h, *normed, *blk, *xt, *qkv, *z, *ga, *gb, *lin_o;
     ds4_gpu_tensor *qg, *q, *gate, *kp, *vp, *o, *ffn_g, *ffn_u, *logits, *tokens;
     ds4_gpu_tensor *pos3;
+    /* Split-K accumulation for the attention core: one online-softmax partial
+     * (running max, denominator, accumulation) per (token, head, key range),
+     * which attn_merge reduces into the row's output.  Allocated once for the
+     * worst case a single call can hand over; unused while the dispatcher picks
+     * one split, which is what happens under 32 keys. */
+    ds4_gpu_tensor *attn_partial;
     ds4_gpu_tensor *lin_state[DS4_MAX_LAYER];
     ds4_gpu_tensor *lin_hist[DS4_MAX_LAYER];
     ds4_gpu_tensor *k_cache[DS4_MAX_LAYER];
@@ -68961,18 +68967,28 @@ static bool qwen35_graph_linear(ds4_qwen35_gpu_graph *g, const ds4_model *m,
 /* The Bonsai attention core runs a chunk in row batches of at most this many
  * rows.  Two reasons, both load-bearing:
  *
- *  - The row-exact kernel (the qwen4 `attention` template with a single split)
- *    computes each row's softmax over keys 0..pos0+t, the same accumulation
- *    the one-token path performs at that position, so each row sees exactly
- *    the keys and the same reduction order decode would use.  The token-tile
- *    fast path (attention_group, selected at T >= 32) accumulates the same sum
- *    differently AND, measured 2026-09-24, faults with an illegal
+ *  - The row-exact kernel (the qwen4 `attention` template) computes each row's
+ *    softmax over keys 0..pos0+t, so a row sees exactly the keys decode would
+ *    see at that position, with the gate and the merge the dispatcher applies.
+ *    The token-tile fast path (attention_group, selected at T >= 32) accumulates
+ *    the same sum differently AND, measured 2026-09-24, faults with an illegal
  *    shared-memory access at this geometry (H/Hkv = 6, D = 256) inside its
  *    first B-tile ldmatrix - a latent defect of that kernel, reachable here
  *    for the first time because Bonsai had no T >= 32 caller before chunked
- *    prefill.  It must not be selected until it is fixed and verified.
- *  - At T <= 16 the dispatcher cannot select that path at all, so nothing here
- *    depends on the gate in ds4_gpu_qwen4_attn_decode_tensor.
+ *    prefill.  It must not be selected until it is fixed and verified, and
+ *    handing the dispatcher a partial buffer (below) skips it unconditionally,
+ *    so raising this batch size could not revive it by accident.
+ *  - At T <= 16 the dispatcher would not select that path anyway, so nothing
+ *    here depends on the gate in ds4_gpu_qwen4_attn_decode_tensor.
+ *
+ * The batch is given a key-split buffer, so the dispatcher cuts each row's key
+ * range into up to 64 ranges (one per 32 keys, capped) and attn_merge reduces
+ * them.  That changes the reduction order, and the split order is the better
+ * one: measured 2026-09-24 against a double-precision scalar reference at this
+ * geometry, the split core sits ~1e-8 from it at pos0 = 32768 where a single
+ * 32K-key online-softmax chain drifts ~1e-6 (test_attention_split in
+ * tests/test_qwen35_cuda.cu).  Under 32 keys the dispatcher picks one split and
+ * the buffer goes unused.
  *
  * The rows of a batched pass are not bit-identical to a per-token pass, and
  * not because of this kernel: the projections around it accumulate over N
@@ -68981,6 +68997,11 @@ static bool qwen35_graph_linear(ds4_qwen35_gpu_graph *g, const ds4_model *m,
  * sizes 1..64: same token stream, top-logit values differing in the 4th
  * decimal; and the CPU reference agrees with the GPU on the ids). */
 #define DS4_QWEN35_ATTN_ROWS 16u
+
+/* Key-split ceiling the attention dispatcher applies when it is given a
+ * partial buffer (ds4_gpu_qwen4_attn_decode_tensor: splits = min(64, ...)).
+ * The arena sizes the partial buffer for this bound, so the two must agree. */
+#define DS4_QWEN35_ATTN_SPLITS 64u
 
 static bool qwen35_graph_attention(ds4_qwen35_gpu_graph *g, const ds4_model *m,
                                    const ds4_layer_weights *l, uint32_t il,
@@ -69016,7 +69037,7 @@ static bool qwen35_graph_attention(ds4_qwen35_gpu_graph *g, const ds4_model *m,
                                                      (uint64_t)rt * q_dim * sizeof(float)) : g->o;
         const bool ok = q && gate && o &&
             ds4_gpu_qwen4_attn_decode_tensor(o, q, gate, g->k_cache[il], g->v_cache[il],
-                                             NULL, NULL, NULL, rt, H, Hkv, D,
+                                             NULL, NULL, g->attn_partial, rt, H, Hkv, D,
                                              pos0 + r0, false, 0u, 1.0f / sqrtf((float)D));
         if (r0) {
             ds4_gpu_tensor_free(q);
@@ -69065,7 +69086,7 @@ static void qwen35_graph_free(ds4_qwen35_gpu_graph *g) {
     ds4_gpu_tensor *scratch[] = {
         g->h, g->normed, g->blk, g->xt, g->qkv, g->z, g->ga, g->gb, g->lin_o,
         g->qg, g->q, g->gate, g->kp, g->vp, g->o, g->ffn_g, g->ffn_u, g->logits,
-        g->tokens, g->pos3,
+        g->tokens, g->pos3, g->attn_partial,
     };
     for (size_t i = 0; i < sizeof(scratch) / sizeof(scratch[0]); i++) {
         ds4_gpu_tensor_free(scratch[i]);
@@ -69118,6 +69139,13 @@ static bool qwen35_graph_open(ds4_qwen35_gpu_graph *g, ds4_engine *e, uint32_t c
     g->kp     = ds4_gpu_tensor_alloc((uint64_t)T * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * f32);
     g->vp     = ds4_gpu_tensor_alloc((uint64_t)T * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * f32);
     g->o      = ds4_gpu_tensor_alloc((uint64_t)T * DS4_N_HEAD * DS4_N_HEAD_DIM * f32);
+    /* Worst case one attention call can hand the kernel: the row batch (see
+     * DS4_QWEN35_ATTN_ROWS), every head, the dispatcher's split ceiling, and
+     * the two extra floats a partial record carries. */
+    const uint32_t attn_rows = T < DS4_QWEN35_ATTN_ROWS ? T : DS4_QWEN35_ATTN_ROWS;
+    g->attn_partial = ds4_gpu_tensor_alloc((uint64_t)attn_rows * DS4_N_HEAD *
+                                           DS4_QWEN35_ATTN_SPLITS *
+                                           (DS4_N_HEAD_DIM + 2u) * f32);
     g->ffn_g  = ds4_gpu_tensor_alloc((uint64_t)T * F * f32);
     g->ffn_u  = ds4_gpu_tensor_alloc((uint64_t)T * F * f32);
     g->logits = ds4_gpu_tensor_alloc((uint64_t)DS4_N_VOCAB * f32);
@@ -69126,7 +69154,7 @@ static bool qwen35_graph_open(ds4_qwen35_gpu_graph *g, ds4_engine *e, uint32_t c
 
     bool ok = g->h && g->normed && g->blk && g->xt && g->qkv && g->z &&
               g->ga && g->gb && g->lin_o && g->qg && g->q && g->gate && g->kp && g->vp &&
-              g->o && g->ffn_g && g->ffn_u && g->logits && g->tokens && g->pos3;
+              g->o && g->attn_partial && g->ffn_g && g->ffn_u && g->logits && g->tokens && g->pos3;
 
     /* Position table for the rope: this model carries one text position per
      * token, so all four sections share it. */
