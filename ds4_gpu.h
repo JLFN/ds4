@@ -3453,6 +3453,13 @@ int ds4_gpu_qwen4_idx_expand_tensor(
 /* part (optional, decode-sized batches): partial-softmax scratch of
  * ds4_gpu_qwen4_attn_part_floats() floats enabling key-split parallelism */
 uint64_t ds4_gpu_qwen4_attn_part_floats(uint32_t n_tokens, uint32_t n_head, uint32_t head_dim);
+/* Whether ds4_gpu_qwen4_attn_decode_tensor would run the token-tile MMA
+ * attention kernel for this shape and these caches: that kernel is selected
+ * only when the caller passes no partial buffer and T >= 32, so a caller that
+ * sizes a partial buffer has to ask before deciding the batch it hands over. */
+int ds4_gpu_qwen4_attn_tokentile_available(
+        const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
+        uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim);
 int ds4_gpu_qwen4_attn_decode_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
         const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,

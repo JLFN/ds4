@@ -2312,6 +2312,27 @@ extern "C" int ds4_gpu_qwen4_vision_encode(float *out, const float *patches, con
     return ok;
 }
 
+/* Conditions under which the token-tile MMA attention kernel runs.  One place,
+ * because two callers have to agree on them: this dispatcher, which takes the
+ * kernel whenever it is handed no partial buffer, and the qwen35 graph, which
+ * has to know whether handing over no partial buffer selects that kernel
+ * before it decides to size a batch for it.  Pre-Ampere cards, quality mode and
+ * other head dims answer no, and the caller then keeps the row-exact split-K
+ * path with its per-row batch. */
+static bool attn_tokentile_ok(const ds4_gpu_tensor *kc, const ds4_gpu_tensor *vc,
+                              uint32_t T, uint32_t H, uint32_t Hkv, uint32_t D) {
+    return T >= 32u && D == 256u && Hkv && H % Hkv == 0u && H / Hkv <= 16u &&
+           kc && vc && !((uintptr_t)kc->ptr & 15) && !((uintptr_t)vc->ptr & 15) &&
+           ds4_cuda_attn_tokentile_arch_ok() && !g_quality_mode &&
+           !getenv("DS4_QWEN4_NO_ATTN_MM");
+}
+
+extern "C" int ds4_gpu_qwen4_attn_tokentile_available(
+        const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
+        uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim) {
+    return attn_tokentile_ok(k_cache, v_cache, n_tokens, n_head, n_head_kv, head_dim) ? 1 : 0;
+}
+
 extern "C" int ds4_gpu_qwen4_attn_decode_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *gate, const ds4_gpu_tensor *kc, const ds4_gpu_tensor *vc,
         const ds4_gpu_tensor *sel, const ds4_gpu_tensor *count, ds4_gpu_tensor *partial,
@@ -2322,9 +2343,7 @@ extern "C" int ds4_gpu_qwen4_attn_decode_tensor(ds4_gpu_tensor *out, const ds4_g
         !tensor(out, n) || !tensor(q, n) || !tensor(gate, n) || !tensor(kc, cb) || !tensor(vc, cb) ||
         (sparse && (!stride || !tensor(sel, (uint64_t)T * stride * 4) || !tensor(count, (uint64_t)T * 4)))) return 0;
     const unsigned keys = sparse ? stride : pos0 + T;
-    if (!partial && T >= 32 && D == 256 && H/Hkv <= 16 &&
-        !((uintptr_t)kc->ptr&15) && !((uintptr_t)vc->ptr&15) &&
-        ds4_cuda_attn_tokentile_arch_ok() && !g_quality_mode && !getenv("DS4_QWEN4_NO_ATTN_MM")) {
+    if (!partial && attn_tokentile_ok(kc, vc, T, H, Hkv, D)) {
         attention_group<<<dim3(Hkv,T),256,0,cuda_decode_stream()>>>((float *)out->ptr,
             (const float *)q->ptr,(const float *)gate->ptr,(const __half *)kc->ptr,(const __half *)vc->ptr,
             sparse ? (const int *)sel->ptr : NULL,sparse ? (const unsigned *)count->ptr : NULL,

@@ -838,12 +838,20 @@ static bool test_attention_split() {
     constexpr uint32_t splits_max = 64;                 /* dispatcher ceiling */
     constexpr float scale = 1.0f / 16.0f;               /* 1/sqrt(D) */
     constexpr float tol = 3e-5f;                        /* against the oracle */
-    struct attn_case { uint32_t T, pos0; const char *label; };
+    /* tile == true marks the shapes where a NULL partial with T >= 32 selects
+     * the token-tile MMA kernel (warp score tile + one expf per (column, key)),
+     * which is the path the graph hands a prefilled chunk to; tile == false
+     * keeps the row-exact kernel, single-split or split-K. */
+    struct attn_case { uint32_t T, pos0; const char *label; bool tile; };
     const attn_case cases[] = {
-        { 1,  2048, "attention split: decode, ctx 2048"},
-        { 1, 32768, "attention split: decode, ctx 32768"},
-        {16,  2048, "attention split: chunk rows, ctx 2048"},
-        {16, 32768, "attention split: chunk rows, ctx 32768"},
+        { 1,  2048, "attention split: decode, ctx 2048", false},
+        { 1, 32768, "attention split: decode, ctx 32768", false},
+        {16,  2048, "attention split: chunk rows, ctx 2048", false},
+        {16, 32768, "attention split: chunk rows, ctx 32768", false},
+        {32,  2048, "attention token-tile: chunk 32, ctx 2048", true},
+        {32, 32768, "attention token-tile: chunk 32, ctx 32768", true},
+        {33,  4096, "attention token-tile: odd chunk 33, ctx 4096", true},
+        {64, 32768, "attention token-tile: chunk 64, ctx 32768", true},
     };
 
     bool ok = true;
@@ -885,6 +893,10 @@ static bool test_attention_split() {
             continue;
         }
 
+        /* gref is the NULL-partial call, i.e. the single-split row-exact kernel
+         * for T < 32 and the token-tile MMA kernel for T >= 32; gsplit is the
+         * split-K row-exact one.  Which of the two is binding depends on the
+         * shape: see the comparison below. */
         const bool ran =
             ds4_gpu_qwen4_attn_decode_tensor(gref, gq, ggate, gk, gv, NULL, NULL, NULL,
                                              T, H, Hkv, D, pos0, false, 0u, scale) &&
@@ -921,9 +933,17 @@ static bool test_attention_split() {
                                             std::fabs((double)got[i] - (double)ref[i]));
                 ref_scale = std::fmax(ref_scale, std::fabs((double)ref[i]));
             }
-            const double order_limit = 1e-4 * std::fmax(ref_scale, 1e-8);
-            std::fprintf(stderr, "%s: split vs single max|d|=%.2e (order limit %.2e): %s\n",
-                         label, split_vs_single, order_limit,
+            /* Below the token-tile gate the two kernels differ by reduction
+             * order alone, and this bound is what catches a mis-wired split
+             * (a wrong range or a dropped split moves the output by a fraction
+             * of the scale, not by a rounding step).  Above the gate the NULL
+             * partial selects a different kernel entirely, so the same
+             * comparison is a cross-kernel check with the looser bound the
+             * MMA score tile needs. */
+            const double order_limit = (c.tile ? 1e-3 : 1e-4) * std::fmax(ref_scale, 1e-8);
+            std::fprintf(stderr, "%s: %s max|d|=%.2e (order limit %.2e): %s\n",
+                         label, c.tile ? "token-tile vs split" : "split vs single",
+                         split_vs_single, order_limit,
                          split_vs_single <= order_limit ? "PASS" : "FAIL");
             ok = split_vs_single <= order_limit && ok;
 
@@ -969,22 +989,32 @@ static bool test_attention_split() {
                     }
                 }
             }
-            /* What ships is the split order, so that is the binding check.
-             * The single-split kernel is kept as the control, and its own
-             * distance from the oracle grows with the key range because it
-             * runs one fp32 online-softmax chain over every key: measured
-             * 4.7e-6 of the scale at pos0 = 2048 and 9.7e-5 at pos0 = 32768,
-             * i.e. ~20x and ~200x worse than the split order it is compared
-             * against, which is why the long case gets the looser bound. */
+            /* The path that ships for this shape is the binding check and the
+             * other one is its control:
+             *  - tile cases run on the token-tile MMA kernel (gref), bound to
+             *    the oracle at tol, with the split-K order as the control;
+             *  - every other case runs on the split-K kernel (gsplit), bound
+             *    to the oracle, with the single-split chain as the control.
+             * The control's own distance from the oracle grows with the key
+             * range because it runs one fp32 online-softmax chain over every
+             * key: measured 4.7e-6 of the scale at pos0 = 2048 and 9.7e-5 at
+             * pos0 = 32768, i.e. ~20x and ~200x worse than the order it is
+             * compared against, which is why the long cases get the looser
+             * bound. */
             const double split_limit = tol * std::fmax(peak_scale, 1e-8);
             const double ref_limit = (keys >= 8192u ? 3e-4 : tol) * std::fmax(peak_scale, 1e-8);
-            const bool split_ok = worst_split <= split_limit;
-            const bool ref_ok = worst_ref <= ref_limit;
+            const double bind   = c.tile ? worst_ref   : worst_split;
+            const double ctrl   = c.tile ? worst_split : worst_ref;
+            const double bind_lim = c.tile ? tol * std::fmax(peak_scale, 1e-8) : split_limit;
+            const double ctrl_lim = c.tile ? split_limit : ref_limit;
+            const bool bind_ok = bind <= bind_lim;
+            const bool ctrl_ok = ctrl <= ctrl_lim;
             std::fprintf(stderr,
-                         "%s: split max|d|=%.2e (limit %.2e) %s; single max|d|=%.2e (limit %.2e) %s\n",
-                         label, worst_split, split_limit, split_ok ? "PASS" : "FAIL",
-                         worst_ref, ref_limit, ref_ok ? "PASS" : "FAIL");
-            ok = split_ok && ref_ok && ok;
+                         "%s: %s max|d|=%.2e (limit %.2e) %s; %s max|d|=%.2e (limit %.2e) %s\n",
+                         label, c.tile ? "token-tile" : "split", bind, bind_lim,
+                         bind_ok ? "PASS" : "FAIL", c.tile ? "split" : "single", ctrl,
+                         ctrl_lim, ctrl_ok ? "PASS" : "FAIL");
+            ok = bind_ok && ctrl_ok && ok;
         }
 
 cleanup:

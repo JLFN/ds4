@@ -68964,31 +68964,28 @@ static bool qwen35_graph_linear(ds4_qwen35_gpu_graph *g, const ds4_model *m,
     return qwen35_graph_gemv_folded(g, g->blk, m, l->lin_out, g->lin_o, T, true);
 }
 
-/* The Bonsai attention core runs a chunk in row batches of at most this many
- * rows.  Two reasons, both load-bearing:
+/* Row batch ceiling for the batches the Bonsai attention core walks with the
+ * row-exact kernel; a prefilled chunk is handed over in one call instead.
  *
- *  - The row-exact kernel (the qwen4 `attention` template) computes each row's
- *    softmax over keys 0..pos0+t, so a row sees exactly the keys decode would
- *    see at that position, with the gate and the merge the dispatcher applies.
- *    The token-tile fast path (attention_group, selected at T >= 32) accumulates
- *    the same sum differently AND, measured 2026-09-24, faults with an illegal
- *    shared-memory access at this geometry (H/Hkv = 6, D = 256) inside its
- *    first B-tile ldmatrix - a latent defect of that kernel, reachable here
- *    for the first time because Bonsai had no T >= 32 caller before chunked
- *    prefill.  It must not be selected until it is fixed and verified, and
- *    handing the dispatcher a partial buffer (below) skips it unconditionally,
- *    so raising this batch size could not revive it by accident.
- *  - At T <= 16 the dispatcher would not select that path anyway, so nothing
- *    here depends on the gate in ds4_gpu_qwen4_attn_decode_tensor.
- *
- * The batch is given a key-split buffer, so the dispatcher cuts each row's key
- * range into up to 64 ranges (one per 32 keys, capped) and attn_merge reduces
- * them.  That changes the reduction order, and the split order is the better
- * one: measured 2026-09-24 against a double-precision scalar reference at this
- * geometry, the split core sits ~1e-8 from it at pos0 = 32768 where a single
- * 32K-key online-softmax chain drifts ~1e-6 (test_attention_split in
- * tests/test_qwen35_cuda.cu).  Under 32 keys the dispatcher picks one split and
- * the buffer goes unused.
+ *  - A chunk (T >= 32 rows) carries no partial buffer, which is what selects
+ *    the token-tile MMA kernel (attention_group): tensor-core scores and one
+ *    expf per (column, key) instead of one per lane per key.  That kernel was
+ *    unreachable until 2026-09-29: every one of its ldmatrix loads passed a
+ *    32-bit cvta address and faulted on this toolchain, which is why the batch
+ *    used to be capped below the gate and a partial buffer always passed.  It
+ *    now has its own cases in test_attention_split (tests/test_qwen35_cuda.cu)
+ *    at this geometry, measured against the same double-precision oracle as
+ *    the row-exact path.
+ *  - Decode and short batches keep the row-exact kernel the one-token path
+ *    uses, and they are the only callers of the key-split buffer: the
+ *    dispatcher cuts each row's key range into up to DS4_QWEN35_ATTN_SPLITS
+ *    ranges and attn_merge reduces them.  That changes the reduction order,
+ *    and the split order is the better one: measured 2026-09-24 against a
+ *    double-precision scalar reference at this geometry, the split core sits
+ *    ~1e-8 from it at pos0 = 32768 where a single 32K-key online-softmax chain
+ *    drifts ~1e-6.  Under 32 keys the dispatcher picks one split and the
+ *    buffer goes unused, so the arena is sized for this row count times the
+ *    split ceiling and the batch must not exceed it.
  *
  * The rows of a batched pass are not bit-identical to a per-token pass, and
  * not because of this kernel: the projections around it accumulate over N
@@ -69023,12 +69020,25 @@ static bool qwen35_graph_attention(ds4_qwen35_gpu_graph *g, const ds4_model *m,
         return false;
     }
     /* The sigmoid gate rides inside the attention kernel (attn_prep kept the
-     * raw second half of the q projection).  Rows are handed over in batches
-     * of DS4_QWEN35_ATTN_ROWS; each batch is the same kernel the one-token
-     * path uses, at the rows' own positions. */
+     * raw second half of the q projection).  Two kernels serve this core and
+     * the choice is per batch, not per model:
+     *  - a prefilled chunk (T rows, T >= 32) goes over in one call with no
+     *    partial buffer, which selects the token-tile MMA kernel: the scores
+     *    come from tensor cores and its softmax costs one expf per (column,
+     *    key) instead of one per lane per key;
+     *  - decode and short batches keep the row-exact kernel the one-token path
+     *    uses, with the split-K buffer, whose reduction order is that path's.
+     * The split buffer is sized for DS4_QWEN35_ATTN_ROWS rows, so the batch
+     * stays at that size unless the token-tile kernel is really available for
+     * this shape (the query answers for the same conditions the dispatcher
+     * checks); otherwise a long chunk would drop to a single split and lose the
+     * split-K speedup it has today. */
     const uint32_t q_dim = H * D;
-    for (uint32_t r0 = 0; r0 < T; r0 += DS4_QWEN35_ATTN_ROWS) {
-        const uint32_t rt = T - r0 < DS4_QWEN35_ATTN_ROWS ? T - r0 : DS4_QWEN35_ATTN_ROWS;
+    const bool tokentile = T >= 32u && ds4_gpu_qwen4_attn_tokentile_available(
+        g->k_cache[il], g->v_cache[il], T, H, Hkv, D);
+    const uint32_t attn_batch = tokentile ? T : DS4_QWEN35_ATTN_ROWS;
+    for (uint32_t r0 = 0; r0 < T; r0 += attn_batch) {
+        const uint32_t rt = T - r0 < attn_batch ? T - r0 : attn_batch;
         ds4_gpu_tensor *q = r0 ? ds4_gpu_tensor_view(g->q, (uint64_t)r0 * q_dim * sizeof(float),
                                                      (uint64_t)rt * q_dim * sizeof(float)) : g->q;
         ds4_gpu_tensor *gate = r0 ? ds4_gpu_tensor_view(g->gate, (uint64_t)r0 * q_dim * sizeof(float),
@@ -69037,7 +69047,8 @@ static bool qwen35_graph_attention(ds4_qwen35_gpu_graph *g, const ds4_model *m,
                                                      (uint64_t)rt * q_dim * sizeof(float)) : g->o;
         const bool ok = q && gate && o &&
             ds4_gpu_qwen4_attn_decode_tensor(o, q, gate, g->k_cache[il], g->v_cache[il],
-                                             NULL, NULL, g->attn_partial, rt, H, Hkv, D,
+                                             NULL, NULL, tokentile ? NULL : g->attn_partial,
+                                             rt, H, Hkv, D,
                                              pos0 + r0, false, 0u, 1.0f / sqrtf((float)D));
         if (r0) {
             ds4_gpu_tensor_free(q);
@@ -69141,7 +69152,8 @@ static bool qwen35_graph_open(ds4_qwen35_gpu_graph *g, ds4_engine *e, uint32_t c
     g->o      = ds4_gpu_tensor_alloc((uint64_t)T * DS4_N_HEAD * DS4_N_HEAD_DIM * f32);
     /* Worst case one attention call can hand the kernel: the row batch (see
      * DS4_QWEN35_ATTN_ROWS), every head, the dispatcher's split ceiling, and
-     * the two extra floats a partial record carries. */
+     * the two extra floats a partial record carries.  Only the row-exact
+     * batches use it; a token-tile batch is handed no partial buffer at all. */
     const uint32_t attn_rows = T < DS4_QWEN35_ATTN_ROWS ? T : DS4_QWEN35_ATTN_ROWS;
     g->attn_partial = ds4_gpu_tensor_alloc((uint64_t)attn_rows * DS4_N_HEAD *
                                            DS4_QWEN35_ATTN_SPLITS *
