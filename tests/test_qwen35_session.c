@@ -37,6 +37,14 @@ extern int ds4_test_qwen35_ref_greedy(ds4_engine *e, const int *tokens, int n_to
 
 static const char kPromptText[] = "The capital of France is";
 
+/* The attention core has two kernels and the choice is by chunk length: the
+ * row-exact one below 32 rows, the token-tile (MMA) one from 32 rows up.  The
+ * five-token prompt above prefills in 19 rows and therefore never reaches the
+ * second kernel, so the same scenarios are run again on this longer prompt,
+ * which prefills in one chunk above that gate. */
+static const char kLongPromptText[] =
+    "Memory bandwidth is the rate at which data can be read from or stored into " "a semiconductor memory by a processor. The memory bandwidth of a GPU is " "typically expressed in gigabytes per second and is one of the main limits " "on the throughput of large language model inference, because every weight " "of the model must be read for every token that is generated.";
+
 static int failures;
 
 static void report(const char *what, bool ok) {
@@ -302,7 +310,7 @@ int main(void) {
     ds4_engine_options opt = {
         .model_path = model,
         .backend = DS4_BACKEND_CUDA,
-        .context_size = 64,
+        .context_size = 256,   /* the long-prompt pass prefills above the tile gate */
         /* Threads left at the engine default: the CPU reference is the slow
          * part of this test and it is row-parallel across the host pool. */
         .quality = false,
@@ -339,6 +347,31 @@ int main(void) {
     scenario_rewind_replay(e, &prompt, steps, want);
     scenario_invalidate(e, &prompt, steps, want);
     scenario_context_bound(e, &prompt);
+
+    /* Second pass: a prompt long enough that the prefill chunk clears the
+     * token-tile gate, so the same five scenarios check that kernel's identity
+     * against the CPU reference too. */
+    ds4_tokens long_prompt = {0};
+    ds4_tokenize_text(e, kLongPromptText, &long_prompt);
+    if (long_prompt.len < 40) {
+        report("long prompt tokenizes above the token-tile gate", false);
+    } else {
+        printf("\nlong prompt: \"%s...\" -> %d tokens\n", "Memory bandwidth", long_prompt.len);
+        report("long prompt tokenizes above the token-tile gate", true);
+        int want_long[MAX_STEPS];
+        if (ds4_test_qwen35_ref_greedy(e, long_prompt.v, long_prompt.len, steps,
+                                       want_long, MAX_STEPS) != steps) {
+            report("long prompt: the CPU reference run succeeds", false);
+        } else {
+            print_ids("CPU reference (long prompt)", want_long, steps);
+            printf("\n");
+            scenario_plain(e, &long_prompt, steps, want_long);
+            scenario_prefix_reuse(e, &long_prompt, steps, want_long);
+            scenario_rewind_replay(e, &long_prompt, steps, want_long);
+            scenario_invalidate(e, &long_prompt, steps, want_long);
+        }
+    }
+    ds4_tokens_free(&long_prompt);
 
     ds4_tokens_free(&prompt);
     ds4_engine_close(e);
