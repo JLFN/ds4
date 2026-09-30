@@ -197,6 +197,30 @@ GLM uses graph-selected prefill chunks and does not accept `--prefill-chunk`
 or an external `--mtp-model`. It currently requires `--power 100`.
 Directional steering is supported for GLM 5.3, not GLM 5.2.
 
+## Ternary Bonsai 2 27B
+
+`./download_model.sh bonsai-pq2` downloads one **6.71 GiB** GGUF from
+[prism-ml/Ternary-Bonsai-2-27B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf),
+verifies its published SHA-256 and links `ds4flash.gguf` to it.
+
+Bonsai is a dense 26.90 B qwen35 trunk: 64 layers, 48 of them gated delta-net
+and 16 gated-attention at interval 4, with a dense SwiGLU FFN, no MoE, no
+n-gram embeddings and no MTP block. Its matmul weights are all PQ2_0, 2.125
+bits per weight and Hadamard-folded. The loader accepts that quantization only,
+so the repository's other files (F16, Q2_0, Q2_g64, PTQ1_0 and the dspark pair)
+are not DwarfStar models.
+
+```sh
+./download_model.sh bonsai-pq2
+./ds4 --cuda -p "The capital of France is"
+```
+
+The model runs on CUDA and on the CPU reference; there is no Metal or ROCm
+kernel for PQ2_0 yet, and no vision path for the family. On a small card the
+context decides the fit: 49152 works on a 12 GB GPU, 57344 is comfortable, and
+65536 fails at the first request. See [Bonsai setup](BONSAI.md) for the block
+format, the measured context ladder, serving and validation.
+
 ## Vision
 
 PNG and JPEG input works in the CLI, native agent, and HTTP server on Metal,

@@ -9,6 +9,7 @@ QWEN38_REPO="antirez/qwen3.8-flash-next-gguf"
 QWEN38_MMPROJ_REPO="ggml-org/Qwen3.8-Flash-Next-GGUF"
 REPO="antirez/deepseek-v4-gguf"
 DS41_REPO="antirez/deepseek-v4.1-flash-gguf"
+BONSAI_REPO="prism-ml/Ternary-Bonsai-2-27B-gguf"
 DS41_Q2_FILE="DeepSeek-V4.1-Flash-Q2.gguf"
 DS41_Q4_FILE="DeepSeek-V4.1-Flash-Q4.gguf"
 DS41_VISION_FILE="DeepSeek-V4.1-Flash-Vision.gguf"
@@ -39,6 +40,7 @@ GLM53_VISION_FILE="GLM-5.3-Flash-Vision-Encoder.gguf"
 QWEN38_Q4_FILE="Qwen3.8-Flash-Next-Q4.gguf"
 QWEN38_Q2_FILE="Qwen3.8-Flash-Next-Q2.gguf"
 QWEN38_VISION_FILE="mmproj-Qwen3.8-Flash-Next-Q8_0.gguf"
+BONSAI_PQ2_FILE="Ternary-Bonsai-2-27B-PQ2_0.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${DS4_GGUF_DIR:-"$ROOT/gguf"}
@@ -82,6 +84,7 @@ Usage:
   ./download_model.sh qwen38-q2 [--token TOKEN]
   ./download_model.sh qwen38-q4k [--token TOKEN]
   ./download_model.sh qwen38-vision [--token TOKEN]
+  ./download_model.sh bonsai-pq2 [--token TOKEN]
 
 Targets:
 
@@ -215,6 +218,18 @@ Targets:
   qwen38-vision
        Qwen3.8-Flash-Next vision encoder, about 0.6 GB on disk. Load it
        with --vision; this target does not update ./ds4flash.gguf.
+
+  bonsai-pq2
+       Prism Ternary Bonsai 2 27B (PQ2_0), the ternary qwen35 trunk of the
+       Bonsai port: one 6.71 GiB GGUF. Every matmul weight is PQ2_0
+       (2.125 bits per weight, Hadamard-folded, so the engine rotates the
+       activation instead of the weight); norms and the ssm scalars stay
+       F32 and the two ssm gates stay BF16. The loader accepts this
+       quantization only, so the repo's F16, Q2_0, Q2_g64, PTQ1_0 and
+       dspark files do not apply to DwarfStar. CUDA backend plus the CPU
+       reference; there is no Metal or ROCm kernel for PQ2_0 yet, and no
+       vision path for this family. See docs/MODELS.md for the measured
+       context sizes on a 12 GB card.
 
 Options:
   --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF token
@@ -377,6 +392,11 @@ case "$MODEL" in
         FORCE_HF_DOWNLOAD=1
         LINK_MODEL=0
         ;;
+    bonsai-pq2)
+        REPO=$BONSAI_REPO
+        MODEL_FILE=$BONSAI_PQ2_FILE
+        FORCE_HF_DOWNLOAD=1
+        ;;
     -h|--help|help)
         usage
         exit 0
@@ -476,6 +496,10 @@ artifact_identity() {
         "$DS41_VISION_FILE")
             expected_bytes=970555552
             expected_sha=cc283f032b3e8b8d78aeb5fccaa14e97b859b0c53aae3cd6bffa690ddf0e9e15
+            ;;
+        "$BONSAI_PQ2_FILE")
+            expected_bytes=7206168928
+            expected_sha=3907dc1658db1f78a9826bf8d5bcb8dc65db0d466388937af57f2294fae62ec1
             ;;
         *) return 1 ;;
     esac

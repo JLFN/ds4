@@ -192,6 +192,19 @@ Add `--mtp` for speculative decoding. The larger
 with `./download_model.sh qwen38-vision` and pass it with `--vision`.
 See [Qwen setup](docs/QWEN38_FLASH_NEXT.md) for details.
 
+Ternary Bonsai 2 27B is a Prism ternary trunk: 26.90 B parameters in a dense
+64-layer hybrid-attention body, with every matmul weight at 2.125 bits. It runs
+on the CUDA path and the CPU reference:
+
+```sh
+./download_model.sh bonsai-pq2
+./ds4 --cuda -p "The capital of France is"
+```
+
+The download is one 6.71 GiB file and updates `ds4flash.gguf`; there is no
+Metal or ROCm kernel for its PQ2_0 quantization yet. See
+[Bonsai setup](docs/BONSAI.md) for the context sizes that fit a 12 GB card.
+
 Speculative decoding is opt-in. GLM and Qwen use `--mtp`; V4 Flash DSpark needs a matching
 support GGUF. It can improve generation, but not every workload benefits.
 Read [speculative decoding](docs/SPECULATIVE_DECODING.md) for setup and the
@@ -252,6 +265,7 @@ DGX Spark results, comparison conditions, and benchmark commands.
 
 - [Models and vision](docs/MODELS.md): Flash, PRO, GLM, Qwen, and matching encoders.
 - [Qwen3.8 Flash Next](docs/QWEN38_FLASH_NEXT.md): model setup, MTP, vision, and validation.
+- [Ternary Bonsai 2 27B](docs/BONSAI.md): the ternary qwen35 trunk, its block format, and how to run it.
 - [SSD streaming](docs/SSD_STREAMING.md): run larger than RAM and size the cache.
 - [Inference across machines](docs/DISTRIBUTED.md): two-Mac TP/RDMA and layer pipelines.
 - [Speculative decoding](docs/SPECULATIVE_DECODING.md): DSpark, GLM and Qwen MTP, and sampling.
